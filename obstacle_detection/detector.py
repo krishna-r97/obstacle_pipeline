@@ -13,9 +13,10 @@ Decision logic (one image, after the car SAM mask is chosen):
     1. car_depth = average depth of the car mask -> foreground/background split.
     2. For every other SAM mask:
          - skip specks (min_area_ratio),
-         - keep only FOREGROUND masks: closer than the car by `depth_margin`.
-           This rejects the background (farther) AND the car's own sub-part masks
-           (windows / wheels / doors -> same depth as the car),
+         - skip the car's own PARTS: masks sitting inside the vehicle silhouette
+           (wheels / windows / doors / lights) via `car_part_containment`,
+         - keep only FOREGROUND masks: closer than the car by `depth_margin`
+           (rejects the background, which is farther),
          - skip the receding GROUND plane via the top-vs-bottom depth delta,
          - flag as an OBSTACLE if it overlaps the car mask by >= `min_car_overlap`
            (fraction of the candidate mask's own pixels lying on the car).
@@ -43,8 +44,9 @@ from depth_anything_3.utils.visualize import visualize_depth
 def find_obstacles(sam_masks, depth_map, car, config=None):
     """Return (obstacle_exist, obstacle_indices).
 
-    A SAM mask is an obstacle iff it is FOREGROUND (closer than the car), is not
-    the receding ground plane, and overlaps the car mask by >= min_car_overlap.
+    A SAM mask is an obstacle iff it is NOT a car part (not inside the vehicle
+    silhouette), is FOREGROUND (closer than the car), is not the receding ground
+    plane, and overlaps the car mask by >= min_car_overlap.
 
     Parameters
     ----------
@@ -55,8 +57,14 @@ def find_obstacles(sam_masks, depth_map, car, config=None):
     """
     cfg = config or ObstacleConfig()
     car_mask_bin = car["car_mask_bin"]
+    vehicle_mask_bin = car.get("vehicle_mask_bin")
     car_idx = car["car_idx"]
     car_depth = car["car_depth"]
+
+    # Reference used to recognise the car's own PARTS. The vehicle silhouette is
+    # the whole car (body + wheels + windows + lights); a SAM mask sitting inside
+    # it is a car part. Fall back to the SAM car mask when no vehicle mask exists.
+    car_part_ref = vehicle_mask_bin if vehicle_mask_bin is not None else car_mask_bin
 
     img_h, img_w = depth_map.shape
     img_area = img_h * img_w
@@ -75,11 +83,22 @@ def find_obstacles(sam_masks, depth_map, car, config=None):
             print(f"[INFO] Skipping Mask {i} - Too small (area_ratio: {mask_area / img_area:.4f})")
             continue
 
+        # --- CAR-PART test: mask sits inside the vehicle silhouette ------------
+        # Wheels / windows / doors / lights are part OF the car. A foreign object
+        # occluding the car is NOT in the vehicle mask, so its containment is ~0.
+        if car_part_ref is not None:
+            part_containment = np.logical_and(s_bin, car_part_ref).sum() / mask_area
+            if part_containment > cfg.car_part_containment:
+                print(f"[INFO] Skipping Mask {i} - Car part "
+                      f"(inside vehicle silhouette: {part_containment:.2%} > "
+                      f"{cfg.car_part_containment:.0%})")
+                continue
+
         # --- FOREGROUND test: must be closer than the car ---------------------
-        # Rejects background (farther) AND car sub-parts (same depth as the car).
+        # Rejects the background (farther than the car).
         mask_depth = float(np.mean(depth_map[s_bin]))
         if mask_depth >= foreground_thresh:
-            kind = "background / behind car" if mask_depth > car_depth else "same depth -> car part"
+            kind = "background / behind car" if mask_depth > car_depth else "at car depth"
             print(f"[INFO] Skipping Mask {i} - Not foreground ({kind}) "
                   f"(depth: {mask_depth:.3f} >= {foreground_thresh:.3f}, car: {car_depth:.3f})")
             continue

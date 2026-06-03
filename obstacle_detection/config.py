@@ -37,12 +37,13 @@ class ObstacleConfig:
     The decision (see detector.find_obstacles) is, for every SAM mask that is
     not the car mask:
         1. drop specks                     (min_area_ratio)
-        2. keep only FOREGROUND masks      (depth_margin)  -- closer than the car;
-           this single test rejects both the background (farther) and the car's
-           own sub-part masks / windows / wheels (same depth as the car).
-        3. drop the receding GROUND plane  (ground_grad_ratio) via the vertical
+        2. drop the car's own PARTS        (car_part_containment) -- masks that sit
+           inside the vehicle silhouette (wheels / windows / doors / lights).
+        3. keep only FOREGROUND masks      (depth_margin) -- closer than the car;
+           rejects the background (farther).
+        4. drop the receding GROUND plane  (ground_grad_ratio) via the vertical
            top-vs-bottom depth delta.
-        4. flag as an OBSTACLE any mask whose pixels overlap the car mask by at
+        5. flag as an OBSTACLE any mask whose pixels overlap the car mask by at
            least `min_car_overlap`.
     The defaults are the values validated on the test_images/obstacle set.
     """
@@ -51,12 +52,20 @@ class ObstacleConfig:
     # thin poles / small bricks still survive).
     min_area_ratio: float = 0.0015
 
+    # CAR-PART rejection. A SAM mask with at least this fraction of its pixels
+    # inside the vehicle silhouette (the vehicle model's segmentation mask) is a
+    # part OF the car -- a wheel / window / door / light / spoiler that SAM
+    # segmented separately -- NOT an obstacle. Depth alone is not enough: the near
+    # wheel can read slightly closer than the car-body average and slip through the
+    # foreground test, so we also use the vehicle mask geometrically. A foreign
+    # object occluding the car is NOT in the vehicle mask, so its containment is
+    # ~0 and it survives this filter.
+    car_part_containment: float = 0.5
+
     # FOREGROUND test. A mask counts as foreground only if it is at least this
     # fraction CLOSER than the car, i.e. mask_depth < car_depth * (1 - depth_margin).
-    # The margin doubles as the "same depth as the car" band: masks within it are
-    # the car body's own sub-parts (windows, wheels, mirrors, doors) that SAM
-    # segmented separately, and masks beyond it (farther) are background -- both
-    # are rejected here.
+    # Masks at or beyond the car's depth (background, or car parts at the same
+    # depth) are rejected here; the small margin also absorbs depth noise.
     depth_margin: float = 0.05
 
     # GROUND-plane rejection. A receding ground/floor mask is far at its top and

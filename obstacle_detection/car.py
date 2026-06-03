@@ -77,7 +77,7 @@ def identify_car_region(sam_masks, depth_map, vehicle_region_bin=None):
     Returns
     -------
     dict with keys:
-        car_mask_bin, car_idx, car_depth, best_iou, seed_src
+        car_mask_bin, vehicle_mask_bin, car_idx, car_depth, best_iou, seed_src
     or None when no car could be identified.
     """
     # Best-overlap SAM mask vs the vehicle region -> the car mask.
@@ -113,6 +113,7 @@ def identify_car_region(sam_masks, depth_map, vehicle_region_bin=None):
     car_depth = float(np.mean(depth_map[car_mask_bin]))   # average depth of the car
     return {
         "car_mask_bin": car_mask_bin,
+        "vehicle_mask_bin": vehicle_region_bin,   # whole car silhouette (parts filter)
         "car_idx": car_idx,
         "car_depth": car_depth,
         "best_iou": best_iou,
