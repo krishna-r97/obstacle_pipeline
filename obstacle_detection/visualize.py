@@ -28,9 +28,14 @@ def obstacle_overlay(result):
     overlay = result["original_img"].copy()
     sam_masks = result["sam_masks"]
 
+    # Prefer the CLEANED car mask (clipped to the vehicle silhouette); fall back to
+    # the raw SAM blob only if it is missing.
+    car_mask_bin = result.get("car_mask_bin")
     car_idx = result.get("car_mask_idx", -1)
-    if car_idx is not None and car_idx >= 0:
-        car_mask = _resize_mask(sam_masks[car_idx] > 0.5, ow, oh)
+    if car_mask_bin is None and car_idx is not None and car_idx >= 0:
+        car_mask_bin = sam_masks[car_idx] > 0.5
+    if car_mask_bin is not None:
+        car_mask = _resize_mask(car_mask_bin, ow, oh)
         overlay[car_mask] = (overlay[car_mask] * 0.5 + CAR_COLOR * 0.5).astype(np.uint8)
 
     for idx in result.get("obstacle_mask_indices", []):

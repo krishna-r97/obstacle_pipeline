@@ -59,7 +59,8 @@ def identify_car_seed_from_sam(sam_masks, depth_map, min_area_ratio=0.02):
 
 
 def identify_car_region(sam_masks, depth_map, vehicle_region_bin=None):
-    """Choose the single SAM mask that represents the car.
+    """Choose the single SAM mask that represents the car, cleaned to the vehicle
+    silhouette.
 
     Parameters
     ----------
@@ -68,9 +69,10 @@ def identify_car_region(sam_masks, depth_map, vehicle_region_bin=None):
     depth_map : np.ndarray (H, W)
         Metric depth.
     vehicle_region_bin : np.ndarray (H, W) bool | None
-        Binary vehicle region (preferably the detection BBOX) from the vehicle
-        model. Used only to pick the best-overlap SAM mask. None when the vehicle
-        model did not fire.
+        Binary vehicle region from the vehicle model -- the segmentation MASK when
+        available (a precise car silhouette), else the detection bbox. Used both to
+        PICK the best-overlap SAM mask and to CLIP it (see below). None when the
+        vehicle model did not fire.
 
     Returns
     -------
@@ -89,7 +91,7 @@ def identify_car_region(sam_masks, depth_map, vehicle_region_bin=None):
             if iou > best_iou:
                 best_iou, car_idx = iou, i
 
-    seed_src = "vehicle-bbox" if car_idx != -1 else "SAM-only"
+    seed_src = "vehicle" if car_idx != -1 else "SAM-only"
     if car_idx == -1:
         # No vehicle to seed from -> identify the car from SAM directly.
         car_idx = identify_car_seed_from_sam(sam_masks, depth_map)
@@ -97,6 +99,17 @@ def identify_car_region(sam_masks, depth_map, vehicle_region_bin=None):
         return None
 
     car_mask_bin = sam_masks[car_idx] > 0.5
+
+    # CLIP the SAM car blob to the vehicle silhouette. SAM sometimes merges the
+    # car with the ground/shadow it sits on into one mask; without this clip those
+    # ground pixels stay in the "car mask" and a foreground shadow/ground blob far
+    # from the car would (wrongly) overlap them and be flagged as an obstacle. The
+    # vehicle region bounds the actual car, so anything outside it is not car.
+    if vehicle_region_bin is not None and vehicle_region_bin.any():
+        clipped = np.logical_and(car_mask_bin, vehicle_region_bin)
+        if clipped.sum() > 0:
+            car_mask_bin = clipped
+
     car_depth = float(np.mean(depth_map[car_mask_bin]))   # average depth of the car
     return {
         "car_mask_bin": car_mask_bin,

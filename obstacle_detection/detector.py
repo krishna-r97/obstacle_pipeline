@@ -119,24 +119,26 @@ def find_obstacles(sam_masks, depth_map, car, config=None):
 # Helpers
 # ---------------------------------------------------------------------------
 def _vehicle_region(veh_res, img_h, img_w):
-    """Binary vehicle region from the vehicle model result. The BBOX is used to
-    pick the car SAM mask (per the pipeline spec); the segmentation mask is only a
-    fallback when no box is available. Returns None when nothing was detected."""
+    """Binary vehicle region from the vehicle model result, used to pick AND clip
+    the car SAM mask. The segmentation MASK (a precise car silhouette) is preferred;
+    the bbox rectangle is only a fallback -- the rectangle pulls in ground/corner
+    pixels, which made the car selection grab the ground the car sits on. Returns
+    None when nothing was detected."""
     n_veh = len(veh_res.instances) if hasattr(veh_res, "instances") else 0
     if n_veh == 0:
         return None
-    veh_boxes = veh_res.bboxes
-    if len(veh_boxes) > 0:
-        bx1, by1, bx2, by2 = map(int, veh_boxes[0])
-        v_bin = np.zeros((img_h, img_w), dtype=bool)
-        v_bin[by1:by2, bx1:bx2] = True
-        return v_bin
     veh_masks = veh_res.masks
     if len(veh_masks) > 0:
         v_mask = veh_masks[0]
         if v_mask.shape != (img_h, img_w):
             v_mask = cv2.resize(v_mask.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
         return v_mask > 0.5
+    veh_boxes = veh_res.bboxes
+    if len(veh_boxes) > 0:
+        bx1, by1, bx2, by2 = map(int, veh_boxes[0])
+        v_bin = np.zeros((img_h, img_w), dtype=bool)
+        v_bin[by1:by2, bx1:bx2] = True
+        return v_bin
     return None
 
 
@@ -153,7 +155,7 @@ def run_pipeline(image_path, models=None, config=None):
     Returns a result dict consumed by visualize.render_result_figure and the
     notebook plotting cell:
         obstacle_exist, original_img, sam_img, veh_img, da3_img,
-        obstacle_mask_indices, sam_masks, car_mask_idx
+        obstacle_mask_indices, sam_masks, car_mask_idx, car_mask_bin
     """
     print(f"[INFO] Processing {image_path}")
     cfg = config or ObstacleConfig()
@@ -193,6 +195,7 @@ def run_pipeline(image_path, models=None, config=None):
             "obstacle_mask_indices": [],
             "sam_masks": sam_masks,
             "car_mask_idx": -1,
+            "car_mask_bin": None,
         }
 
     if len(sam_masks) == 0:
@@ -223,4 +226,5 @@ def run_pipeline(image_path, models=None, config=None):
         "obstacle_mask_indices": obstacle_mask_indices,
         "sam_masks": sam_masks,
         "car_mask_idx": car["car_idx"],
+        "car_mask_bin": car["car_mask_bin"],
     }
