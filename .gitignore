@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights / large binaries
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+da3_model/
+
+# External cloned repo (has its own git history)
+Depth-Anything-3/
+
+# Data / images / outputs
+test_images/
+*.zip
+
+# Project config
+CLAUDE.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
