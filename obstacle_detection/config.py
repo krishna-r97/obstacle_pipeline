@@ -111,21 +111,6 @@ class ObstacleConfig:
     sam_stability_score_thresh: float = 0.90
 
     # -----------------------------------------------------------------------
-    # DEPTH-image mask augmentation (experimental).
-    # -----------------------------------------------------------------------
-    # Also run SAM on the COLOURISED depth map and append any masks the RGB pass
-    # missed. Objects camouflaged in RGB can stand out in depth. Costs a second
-    # SAM pass per image; a colourised depth map is out-of-distribution for SAM,
-    # so expect some junk masks (rejected by the downstream filters). Toggle off
-    # to get the original single-pass behaviour.
-    use_depth_masks: bool = True
-
-    # A depth-image mask is appended only if its best IoU against every existing
-    # RGB mask is BELOW this -- i.e. it is genuinely new, not a duplicate of a
-    # mask the RGB pass already produced.
-    depth_mask_novel_iou: float = 0.5
-
-    # -----------------------------------------------------------------------
     # OCCLUSION depth-outlier detection (second, mask-independent mechanism).
     # -----------------------------------------------------------------------
     # The mask-overlap logic above only fires when SAM produces a clean separate

@@ -307,60 +307,6 @@ def _resize_to(img, w, h):
     return cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
-def _augment_with_depth_masks(rgb_masks, depth_2d, sam_model, shape, config, device):
-    """Run SAM on the colourised depth image and append masks the RGB pass missed.
-
-    Parameters
-    ----------
-    rgb_masks : np.ndarray (N, H, W)   SAM masks from the RGB image (binary 0/1).
-    depth_2d  : np.ndarray (h, w)      raw metric depth for this image.
-    sam_model : the loaded SAM model.
-    shape     : (H, W)                 depth-map resolution everything is aligned to.
-    config    : ObstacleConfig         uses depth_mask_novel_iou + the SAM knobs.
-    device    : str                    inference device.
-
-    Returns the (possibly extended) mask array. A depth mask is "novel" -- i.e.
-    worth adding -- only if its best IoU against every existing RGB mask is below
-    `depth_mask_novel_iou` (so it is not just a duplicate of a mask we already have).
-    """
-    img_h, img_w = shape
-
-    # Colourise depth -> an RGB image SAM can ingest, at depth-map resolution.
-    depth_vis = visualize_depth(depth_2d)
-    depth_res = _run_sam_everything(sam_model, depth_vis, config, device)
-    depth_masks = depth_res.masks.data.cpu().numpy() if depth_res.masks is not None else []
-    if len(depth_masks) == 0:
-        return rgb_masks
-
-    if depth_masks.shape[1:] != (img_h, img_w):
-        depth_masks = np.array([cv2.resize(m.astype(np.uint8), (img_w, img_h),
-                                           interpolation=cv2.INTER_NEAREST) for m in depth_masks])
-
-    rgb_bin = rgb_masks > 0.5
-    rgb_areas = rgb_bin.reshape(len(rgb_bin), -1).sum(axis=1)   # pixels per RGB mask
-
-    novel = []
-    for d_mask in depth_masks:
-        d_bin = d_mask > 0.5
-        d_area = int(d_bin.sum())
-        if d_area == 0:
-            continue
-        # IoU of this depth mask against every RGB mask; keep it only if it does
-        # not substantially overlap any of them.
-        inter = np.logical_and(rgb_bin, d_bin).reshape(len(rgb_bin), -1).sum(axis=1)
-        union = rgb_areas + d_area - inter
-        best_iou = float((inter / np.maximum(union, 1)).max()) if len(rgb_bin) else 0.0
-        if best_iou < config.depth_mask_novel_iou:
-            novel.append(d_bin.astype(rgb_masks.dtype))
-
-    if novel:
-        print(f"[INFO] Depth pass added {len(novel)} mask(s) the RGB pass missed "
-              f"(of {len(depth_masks)} depth masks).")
-        return np.concatenate([rgb_masks, np.array(novel)], axis=0)
-    print(f"[INFO] Depth pass found {len(depth_masks)} masks, none novel.")
-    return rgb_masks
-
-
 # ---------------------------------------------------------------------------
 # End-to-end pipeline
 # ---------------------------------------------------------------------------
@@ -426,16 +372,6 @@ def run_pipeline(image_path, models=None, config=None):
     if sam_masks.shape[1:] != (img_h, img_w):
         sam_masks = np.array([cv2.resize(m.astype(np.uint8), (img_w, img_h),
                                          interpolation=cv2.INTER_NEAREST) for m in sam_masks])
-
-    # OPTIONAL: augment the RGB masks with masks SAM finds on the DEPTH image.
-    # An object camouflaged in RGB (same colour as its background) can stand out
-    # sharply in depth, so SAM-on-depth can recover masks SAM-on-RGB missed. We
-    # keep only depth masks NOT already represented by an RGB mask. (A colourised
-    # depth map is out-of-distribution for SAM, so the extra masks are best-effort
-    # -- the downstream foreground/ground/overlap filters reject the junk.)
-    if cfg.use_depth_masks:
-        sam_masks = _augment_with_depth_masks(
-            sam_masks, da3_res.depth[0], sam_model, (img_h, img_w), cfg, device)
 
     # Pick the car SAM mask (best overlap with the vehicle bbox; SAM-only fallback).
     v_region_bin = _vehicle_region(veh_res, img_h, img_w)
