@@ -36,6 +36,9 @@ test_images/
 # Project config
 CLAUDE.md
 
+# Logs
+*.log
+
 # OS / editor
 .DS_Store
 Thumbs.db
