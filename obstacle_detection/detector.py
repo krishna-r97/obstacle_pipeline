@@ -37,6 +37,47 @@ from .car import identify_car_region
 # Depth-Anything-3 repo to sys.path, which is what makes this import resolve.
 from depth_anything_3.utils.visualize import visualize_depth
 
+# Whether this ultralytics build accepts SAM's automatic-mask-generator kwargs
+# (points_stride / crop_n_layers / conf_thres / ...) through model(...). Some
+# builds validate kwargs against the YOLO cfg and reject them. We probe once on
+# the first call and cache the answer so we only warn once and don't keep
+# retrying the failing path. None = not yet probed.
+_SAM_AMG_SUPPORTED = None
+
+
+def _run_sam_everything(sam_model, source, config, device):
+    """Run SAM2 in 'segment everything' mode, applying the coverage knobs from
+    config when this ultralytics build supports them, else falling back cleanly.
+
+    `source` may be an image path or an RGB numpy array (the depth pass uses an
+    array). Returns the first Results object.
+    """
+    global _SAM_AMG_SUPPORTED
+    base = dict(device=device, verbose=False)
+
+    if _SAM_AMG_SUPPORTED is False:
+        return sam_model(source, **base)[0]
+
+    amg = dict(
+        points_stride=config.sam_points_stride,
+        crop_n_layers=config.sam_crop_n_layers,
+        crop_overlap_ratio=config.sam_crop_overlap_ratio,
+        conf_thres=config.sam_conf_thres,
+        stability_score_thresh=config.sam_stability_score_thresh,
+    )
+    try:
+        res = sam_model(source, **base, **amg)[0]
+        _SAM_AMG_SUPPORTED = True
+        return res
+    except Exception as e:  # ultralytics raises SyntaxError for unknown cfg keys
+        if _SAM_AMG_SUPPORTED is None:
+            print(f"[WARN] This ultralytics build rejects SAM auto-mask-generator "
+                  f"kwargs ({type(e).__name__}); using default 'segment everything' "
+                  f"density. To tune coverage, drive the predictor's generate() "
+                  f"directly or upgrade ultralytics.")
+        _SAM_AMG_SUPPORTED = False
+        return sam_model(source, **base)[0]
+
 
 # ---------------------------------------------------------------------------
 # Core decision (pure: numpy in, verdict out)
@@ -165,17 +206,17 @@ def _resize_to(img, w, h):
     return cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
-def _augment_with_depth_masks(rgb_masks, depth_2d, sam_model, sam_kwargs, shape, config):
+def _augment_with_depth_masks(rgb_masks, depth_2d, sam_model, shape, config, device):
     """Run SAM on the colourised depth image and append masks the RGB pass missed.
 
     Parameters
     ----------
     rgb_masks : np.ndarray (N, H, W)   SAM masks from the RGB image (binary 0/1).
     depth_2d  : np.ndarray (h, w)      raw metric depth for this image.
-    sam_model, sam_kwargs              the loaded SAM and the same "segment
-                                       everything" kwargs used for the RGB pass.
+    sam_model : the loaded SAM model.
     shape     : (H, W)                 depth-map resolution everything is aligned to.
-    config    : ObstacleConfig         uses depth_mask_novel_iou.
+    config    : ObstacleConfig         uses depth_mask_novel_iou + the SAM knobs.
+    device    : str                    inference device.
 
     Returns the (possibly extended) mask array. A depth mask is "novel" -- i.e.
     worth adding -- only if its best IoU against every existing RGB mask is below
@@ -185,7 +226,7 @@ def _augment_with_depth_masks(rgb_masks, depth_2d, sam_model, sam_kwargs, shape,
 
     # Colourise depth -> an RGB image SAM can ingest, at depth-map resolution.
     depth_vis = visualize_depth(depth_2d)
-    depth_res = sam_model(depth_vis, **sam_kwargs)[0]
+    depth_res = _run_sam_everything(sam_model, depth_vis, config, device)
     depth_masks = depth_res.masks.data.cpu().numpy() if depth_res.masks is not None else []
     if len(depth_masks) == 0:
         return rgb_masks
@@ -242,18 +283,9 @@ def run_pipeline(image_path, models=None, config=None):
 
     sam_model, veh_handler, da3_handler, device = models or get_models()
 
-    # Run SAM2 in "segment everything" mode with the coverage knobs from config
-    # (denser prompt grid + crop passes + looser quality cutoffs) so fewer objects
-    # are missed. See ObstacleConfig for what each knob does and its trade-off.
-    sam_kwargs = dict(
-        device=device, verbose=False,
-        points_stride=cfg.sam_points_stride,
-        crop_n_layers=cfg.sam_crop_n_layers,
-        crop_overlap_ratio=cfg.sam_crop_overlap_ratio,
-        conf_thres=cfg.sam_conf_thres,
-        stability_score_thresh=cfg.sam_stability_score_thresh,
-    )
-    sam_res = sam_model(image_path, **sam_kwargs)[0]
+    # Run SAM2 in "segment everything" mode (with the coverage knobs from config
+    # when this ultralytics build supports them -- see _run_sam_everything).
+    sam_res = _run_sam_everything(sam_model, image_path, cfg, device)
     veh_res = veh_handler.infer(image_path)
     da3_res = da3_handler.infer([original_img])
 
@@ -299,7 +331,7 @@ def run_pipeline(image_path, models=None, config=None):
     # -- the downstream foreground/ground/overlap filters reject the junk.)
     if cfg.use_depth_masks:
         sam_masks = _augment_with_depth_masks(
-            sam_masks, da3_res.depth[0], sam_model, sam_kwargs, (img_h, img_w), cfg)
+            sam_masks, da3_res.depth[0], sam_model, (img_h, img_w), cfg, device)
 
     # Pick the car SAM mask (best overlap with the vehicle bbox; SAM-only fallback).
     v_region_bin = _vehicle_region(veh_res, img_h, img_w)
