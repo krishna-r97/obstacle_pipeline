@@ -79,3 +79,48 @@ class ObstacleConfig:
     # the car mask. >= 5% overlap -> the foreground object is on/against the car
     # silhouette and is flagged as an obstacle. There can be several such masks.
     min_car_overlap: float = 0.05
+
+    # -----------------------------------------------------------------------
+    # SAM2 "segment everything" coverage knobs.
+    # -----------------------------------------------------------------------
+    # With no box/point prompt, ultralytics runs SAM2's automatic mask generator:
+    # it lays a regular grid of point prompts, runs SAM at each, then filters the
+    # masks by confidence + stability. Objects get MISSED when no grid point lands
+    # on them (thin poles, small/distant objects) or when their mask falls below
+    # the quality cutoffs. These are passed straight into the sam_model(...) call
+    # (see detector.run_pipeline). Raise grid density / lower the cutoffs to catch
+    # more, at the cost of speed and more fragment masks downstream.
+
+    # Prompt-grid density: an NxN grid of point prompts (32 -> 1024 points). The
+    # single biggest lever for "SAM skipped a whole object". 64 ~= 4x the prompts.
+    sam_points_stride: int = 64
+
+    # Extra zoomed-in crop passes (0 = full image only). 1 re-runs SAM on
+    # overlapping sub-crops at higher effective resolution -> recovers small /
+    # distant objects the full-image grid walks past. Most expensive knob.
+    sam_crop_n_layers: int = 1
+
+    # Overlap fraction between those crops so objects on a crop seam aren't lost.
+    sam_crop_overlap_ratio: float = 0.34
+
+    # Mask-quality (confidence) cutoff. Lower than the ~0.88 default -> keep more
+    # marginal masks instead of discarding them.
+    sam_conf_thres: float = 0.80
+
+    # Mask-stability cutoff. Lower than the ~0.95 default -> keep more masks.
+    sam_stability_score_thresh: float = 0.90
+
+    # -----------------------------------------------------------------------
+    # DEPTH-image mask augmentation (experimental).
+    # -----------------------------------------------------------------------
+    # Also run SAM on the COLOURISED depth map and append any masks the RGB pass
+    # missed. Objects camouflaged in RGB can stand out in depth. Costs a second
+    # SAM pass per image; a colourised depth map is out-of-distribution for SAM,
+    # so expect some junk masks (rejected by the downstream filters). Toggle off
+    # to get the original single-pass behaviour.
+    use_depth_masks: bool = True
+
+    # A depth-image mask is appended only if its best IoU against every existing
+    # RGB mask is BELOW this -- i.e. it is genuinely new, not a duplicate of a
+    # mask the RGB pass already produced.
+    depth_mask_novel_iou: float = 0.5
