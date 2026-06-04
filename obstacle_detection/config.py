@@ -124,3 +124,30 @@ class ObstacleConfig:
     # RGB mask is BELOW this -- i.e. it is genuinely new, not a duplicate of a
     # mask the RGB pass already produced.
     depth_mask_novel_iou: float = 0.5
+
+    # -----------------------------------------------------------------------
+    # OCCLUSION depth-outlier detection (second, mask-independent mechanism).
+    # -----------------------------------------------------------------------
+    # The mask-overlap logic above only fires when SAM produces a clean separate
+    # mask for the occluder. Thin / wispy / translucent things (a bush, a cable,
+    # rebar) are hard for SAM to segment, so they slip through. This mechanism is
+    # orthogonal: it scans the FILLED car region (convex hull of the car mask) for
+    # connected blobs whose depth is anomalously CLOSER than the car's own surface
+    # -- i.e. something occluding the car -- regardless of whether SAM segmented it.
+    # The verdict is OR'd with the mask-overlap verdict (see detector.run_pipeline).
+    use_occlusion_depth: bool = True
+
+    # How much CLOSER than the car's (plane-detrended) surface a pixel must be to
+    # count as an occluder, as a fraction of the car's average depth. The car has a
+    # natural front-to-back gradient which we remove by plane-fitting first, so this
+    # only needs to clear residual noise + lean toward genuine occlusion. Larger =
+    # stricter (fewer false positives on glass/edges), smaller = more sensitive.
+    occlusion_depth_margin: float = 0.08
+
+    # Minimum size of an outlier BLOB, as a fraction of the image area, before it is
+    # treated as an occluder. Filters depth halos / single-pixel boundary noise.
+    occlusion_min_area_ratio: float = 0.003
+
+    # Erode the raw outlier map by this many pixels before blob analysis, to peel
+    # off the thin depth-halo that hugs the car's own silhouette edge. 0 disables.
+    occlusion_erode_px: int = 2

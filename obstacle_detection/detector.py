@@ -176,6 +176,100 @@ def find_obstacles(sam_masks, depth_map, car, config=None):
 
 
 # ---------------------------------------------------------------------------
+# Second mechanism: occlusion via depth outliers (mask-independent)
+# ---------------------------------------------------------------------------
+def find_occlusion_obstacles(car, depth_map, config=None):
+    """Detect occluders that punch through the car silhouette as DEPTH OUTLIERS.
+
+    Independent of SAM mask quality. `find_obstacles` only fires when SAM produces
+    a clean separate mask for the occluder; thin / wispy / translucent things (a
+    bush, a cable, rebar) defeat that. Here we instead scan the FILLED car region
+    (convex hull of the car mask -- so the occluder's "hole" in the silhouette is
+    covered) for connected blobs whose depth is anomalously CLOSER than the car's
+    own surface. Anything between the camera and the car reads closer, so an
+    occluder shows up as a near-depth blob sitting on/inside the car.
+
+    Robustness steps, in order, against the obvious false positives:
+      1. PLANE-DETREND the car's natural front-to-back depth gradient (the near
+         bumper is genuinely closer than the far one) by fitting z = ax+by+c to the
+         depth over the actual CAR pixels; we threshold on the residual, not the raw
+         distance to the car's mean depth.
+      2. require the pixel to be closer than that fitted surface by `occlusion_
+         depth_margin` (absorbs depth noise; leans toward real occlusion).
+      3. ERODE the outlier map to peel the thin depth-halo on the car's own edge.
+      4. keep only BLOBS >= `occlusion_min_area_ratio` (drops halo / pixel noise).
+      5. keep only blobs that BORDER the car mask -- a true occluder sits against
+         the car; this drops hull "overspill" into unrelated foreground at the
+         hull's edge that is not actually on the car.
+
+    Depth convention: depth_map is METRIC -> SMALLER = CLOSER, so a closer-than-car
+    pixel has expected_depth - depth_map > 0.
+
+    Returns (found, occlusion_mask_bin) -- occlusion_mask_bin is a boolean (H, W)
+    map of the flagged outlier pixels (all-False when nothing is found).
+    """
+    cfg = config or ObstacleConfig()
+    car_mask_bin = car["car_mask_bin"]
+    car_depth = car["car_depth"]
+    H, W = depth_map.shape
+    empty = np.zeros((H, W), dtype=bool)
+
+    ys, xs = np.where(car_mask_bin)
+    if len(ys) < 3:                       # need >=3 points to fit a plane
+        return False, empty
+
+    # --- scan region: convex hull of the car mask -------------------------------
+    pts = np.column_stack([xs, ys]).astype(np.int32)
+    hull = cv2.convexHull(pts)
+    hull_region = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillConvexPoly(hull_region, hull, 1)
+    hull_bin = hull_region.astype(bool)
+
+    # --- detrend: fit a plane to the car's depth, extrapolate over the image -----
+    A = np.column_stack([xs, ys, np.ones(len(xs))]).astype(np.float64)
+    z = depth_map[car_mask_bin].astype(np.float64)
+    (a, b, c), *_ = np.linalg.lstsq(A, z, rcond=None)
+    yy, xx = np.mgrid[0:H, 0:W]
+    expected = a * xx + b * yy + c                 # the car surface, extrapolated
+    closer_amt = expected - depth_map              # > 0 => closer than the car
+
+    margin = car_depth * cfg.occlusion_depth_margin
+    outlier = hull_bin & (closer_amt > margin)
+    if not outlier.any():
+        print("[INFO] Occlusion pass - no depth outliers in the car region.")
+        return False, empty
+
+    # --- peel the silhouette-edge halo ------------------------------------------
+    if cfg.occlusion_erode_px > 0:
+        k = np.ones((cfg.occlusion_erode_px * 2 + 1,) * 2, np.uint8)
+        outlier = cv2.erode(outlier.astype(np.uint8), k).astype(bool)
+        if not outlier.any():
+            print("[INFO] Occlusion pass - outliers were edge-halo only (eroded away).")
+            return False, empty
+
+    # --- keep sizable blobs that border the car ---------------------------------
+    min_area = H * W * cfg.occlusion_min_area_ratio
+    car_dil = cv2.dilate(car_mask_bin.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(outlier.astype(np.uint8), 8)
+
+    found_mask = np.zeros((H, W), dtype=bool)
+    for lbl in range(1, n):                         # 0 is background
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+        blob = labels == lbl
+        if not (blob & car_dil).any():              # must sit against the car
+            print(f"[INFO] Occlusion pass - dropping blob (area {area}) not bordering the car.")
+            continue
+        med_closer = float(np.median(closer_amt[blob]))
+        print(f"[RESULT] Occlusion obstacle! Depth-outlier blob area {area} "
+              f"({area / (H * W):.4f} of image), median {med_closer:.3f} closer than car.")
+        found_mask |= blob
+
+    return found_mask.any(), found_mask
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _vehicle_region(veh_res, img_h, img_w):
@@ -312,6 +406,9 @@ def run_pipeline(image_path, models=None, config=None):
             "sam_masks": sam_masks,
             "car_mask_idx": -1,
             "car_mask_bin": None,
+            "occlusion_mask_bin": None,
+            "mask_obstacle_exist": False,
+            "occlusion_exist": False,
         }
 
     if len(sam_masks) == 0:
@@ -342,7 +439,18 @@ def run_pipeline(image_path, models=None, config=None):
     print(f"[INFO] Car = SAM mask {car['car_idx']} ({car['seed_src']}, "
           f"IoU {car['best_iou']:.3f}) | avg depth: {car['car_depth']:.3f}")
 
-    obstacle_exist, obstacle_mask_indices = find_obstacles(sam_masks, depth_map, car, cfg)
+    # Mechanism 1: SAM-mask overlap (a clean separate mask for the occluder).
+    mask_exist, obstacle_mask_indices = find_obstacles(sam_masks, depth_map, car, cfg)
+
+    # Mechanism 2: depth-outlier occlusion (no clean mask needed). OR'd into the
+    # verdict so the two mechanisms cover each other's blind spots.
+    occ_exist, occlusion_mask_bin = (False, None)
+    if cfg.use_occlusion_depth:
+        occ_exist, occlusion_mask_bin = find_occlusion_obstacles(car, depth_map, cfg)
+
+    obstacle_exist = mask_exist or occ_exist
+    print(f"[RESULT] Obstacle exist: {obstacle_exist} "
+          f"(mask-overlap: {mask_exist}, depth-occlusion: {occ_exist})")
 
     sam_img, veh_img, da3_img = _viz_panels()
     return {
@@ -353,4 +461,7 @@ def run_pipeline(image_path, models=None, config=None):
         "sam_masks": sam_masks,
         "car_mask_idx": car["car_idx"],
         "car_mask_bin": car["car_mask_bin"],
+        "occlusion_mask_bin": occlusion_mask_bin,   # depth-outlier occluder pixels
+        "mask_obstacle_exist": mask_exist,          # which mechanism fired
+        "occlusion_exist": occ_exist,
     }

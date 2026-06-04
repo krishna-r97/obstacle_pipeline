@@ -13,8 +13,9 @@ import matplotlib
 import matplotlib.pyplot as plt
 from PIL import Image
 
-CAR_COLOR = np.array([0, 200, 255])      # cyan  -> the chosen car mask
-OBSTACLE_COLOR = np.array([255, 0, 0])   # red   -> obstacle masks
+CAR_COLOR = np.array([0, 200, 255])      # cyan    -> the chosen car mask
+OBSTACLE_COLOR = np.array([255, 0, 0])   # red     -> obstacle masks (SAM-overlap)
+OCCLUSION_COLOR = np.array([255, 0, 255])  # magenta -> depth-outlier occluder pixels
 
 
 def _resize_mask(mask, ow, oh):
@@ -42,6 +43,13 @@ def obstacle_overlay(result):
         obs_mask = _resize_mask(sam_masks[idx] > 0.5, ow, oh)
         overlay[obs_mask] = (overlay[obs_mask] * 0.4 + OBSTACLE_COLOR * 0.6).astype(np.uint8)
 
+    # Depth-outlier occluder (mechanism 2) painted magenta, drawn last so it is
+    # visible even where it coincides with the car/obstacle masks.
+    occ_bin = result.get("occlusion_mask_bin")
+    if occ_bin is not None and occ_bin.any():
+        occ_mask = _resize_mask(occ_bin, ow, oh)
+        overlay[occ_mask] = (overlay[occ_mask] * 0.4 + OCCLUSION_COLOR * 0.6).astype(np.uint8)
+
     return overlay
 
 
@@ -58,9 +66,15 @@ def render_result_figure(result, dpi=200):
 
     axes[4].imshow(obstacle_overlay(result))
     obstacle_indices = result.get("obstacle_mask_indices", [])
-    if result["obstacle_exist"] and obstacle_indices:
-        ids = ", ".join(f"#{i}" for i in obstacle_indices)
-        axes[4].set_title(f"Car (cyan) + Obstacle(s) {ids}", color="red", fontweight="bold")
+    occ_exist = result.get("occlusion_exist", False)
+    if result["obstacle_exist"]:
+        parts = []
+        if obstacle_indices:
+            parts.append("mask " + ", ".join(f"#{i}" for i in obstacle_indices))
+        if occ_exist:
+            parts.append("depth-occlusion (magenta)")
+        axes[4].set_title("Car (cyan) + Obstacle: " + " | ".join(parts),
+                          color="red", fontweight="bold")
     else:
         axes[4].set_title("Car (cyan) - No Obstacle", color="green", fontweight="bold")
 
