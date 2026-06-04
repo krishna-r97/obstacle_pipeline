@@ -144,10 +144,20 @@ class ObstacleConfig:
     # stricter (fewer false positives on glass/edges), smaller = more sensitive.
     occlusion_depth_margin: float = 0.08
 
-    # Minimum size of an outlier BLOB, as a fraction of the image area, before it is
-    # treated as an occluder. Filters depth halos / single-pixel boundary noise.
+    # Minimum TOTAL outlier area (summed over all qualifying pixels on/against the
+    # car), as a fraction of the image area, before we call it an occluder. We sum
+    # rather than require one compact blob so a thin / wispy occluder -- which
+    # fragments into many tiny blobs -- still registers. Filters depth noise.
     occlusion_min_area_ratio: float = 0.003
 
-    # Erode the raw outlier map by this many pixels before blob analysis, to peel
-    # off the thin depth-halo that hugs the car's own silhouette edge. 0 disables.
-    occlusion_erode_px: int = 2
+    # Width of the band around the car silhouette (as a fraction of the smaller
+    # image dimension) within which outliers are considered "on the car". Drops
+    # hull overspill far from the car while still covering occlusion holes punched
+    # into the silhouette. ~0.02 = 2% of the image height.
+    occlusion_band_ratio: float = 0.02
+
+    # Morphological-OPEN cleanup of the outlier map, in pixels. DEFAULT 0 (OFF):
+    # thin / wispy occluders (a plant, a cable) are only a few pixels wide, so
+    # opening would erase them. Raise only if depth noise on the car body produces
+    # scattered false outliers on clean cars.
+    occlusion_erode_px: int = 0

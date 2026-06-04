@@ -239,34 +239,41 @@ def find_occlusion_obstacles(car, depth_map, config=None):
         print("[INFO] Occlusion pass - no depth outliers in the car region.")
         return False, empty
 
-    # --- peel the silhouette-edge halo ------------------------------------------
-    if cfg.occlusion_erode_px > 0:
+    # --- restrict to outliers ON/AGAINST the car --------------------------------
+    # The occluder sits on the car, so we keep only outlier pixels inside a band
+    # around the car silhouette. This drops hull "overspill" (the far building seen
+    # through a hull corner) while still covering occlusion holes punched INTO the
+    # silhouette (the occluder hid those car pixels, but they are within the band).
+    band_px = max(3, int(round(min(H, W) * cfg.occlusion_band_ratio)))
+    car_band = cv2.dilate(car_mask_bin.astype(np.uint8),
+                          np.ones((band_px * 2 + 1,) * 2, np.uint8)).astype(bool)
+    qualifying = outlier & car_band
+
+    # Optional speck cleanup (morphological OPEN). Default OFF: thin / wispy
+    # occluders (a plant, a cable) are only a few pixels wide, so opening would
+    # destroy the very thing we want to catch. Enable only if depth noise on the
+    # car body is producing scattered false outliers.
+    if cfg.occlusion_erode_px > 0 and qualifying.any():
         k = np.ones((cfg.occlusion_erode_px * 2 + 1,) * 2, np.uint8)
-        outlier = cv2.erode(outlier.astype(np.uint8), k).astype(bool)
-        if not outlier.any():
-            print("[INFO] Occlusion pass - outliers were edge-halo only (eroded away).")
-            return False, empty
+        qualifying = cv2.morphologyEx(qualifying.astype(np.uint8), cv2.MORPH_OPEN, k).astype(bool)
 
-    # --- keep sizable blobs that border the car ---------------------------------
+    # --- judge by TOTAL area, not per-blob compactness --------------------------
+    # A wispy occluder fragments into many small blobs; requiring one compact blob
+    # would reject it. The strong depth margin above is the false-positive guard
+    # (glass / edges are only slightly off and never clear it), so we just sum the
+    # qualifying pixels and compare to min_area.
+    total = int(qualifying.sum())
     min_area = H * W * cfg.occlusion_min_area_ratio
-    car_dil = cv2.dilate(car_mask_bin.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(outlier.astype(np.uint8), 8)
+    if total < min_area:
+        print(f"[INFO] Occlusion pass - flagged depth-outlier area too small to act on "
+              f"({total} px = {total / (H * W):.4f} of image < {cfg.occlusion_min_area_ratio}).")
+        return False, empty
 
-    found_mask = np.zeros((H, W), dtype=bool)
-    for lbl in range(1, n):                         # 0 is background
-        area = stats[lbl, cv2.CC_STAT_AREA]
-        if area < min_area:
-            continue
-        blob = labels == lbl
-        if not (blob & car_dil).any():              # must sit against the car
-            print(f"[INFO] Occlusion pass - dropping blob (area {area}) not bordering the car.")
-            continue
-        med_closer = float(np.median(closer_amt[blob]))
-        print(f"[RESULT] Occlusion obstacle! Depth-outlier blob area {area} "
-              f"({area / (H * W):.4f} of image), median {med_closer:.3f} closer than car.")
-        found_mask |= blob
-
-    return found_mask.any(), found_mask
+    med_closer = float(np.median(closer_amt[qualifying]))
+    print(f"[RESULT] Occlusion obstacle! Depth-outlier area {total} "
+          f"({total / (H * W):.4f} of image) on/against the car, "
+          f"median {med_closer:.3f} closer than the car surface.")
+    return True, qualifying
 
 
 # ---------------------------------------------------------------------------
