@@ -183,27 +183,38 @@ def find_occlusion_obstacles(car, depth_map, config=None):
 
     Independent of SAM mask quality. `find_obstacles` only fires when SAM produces
     a clean separate mask for the occluder; thin / wispy / translucent things (a
-    bush, a cable, rebar) defeat that. Here we instead scan the FILLED car region
-    (convex hull of the car mask -- so the occluder's "hole" in the silhouette is
-    covered) for connected blobs whose depth is anomalously CLOSER than the car's
-    own surface. Anything between the camera and the car reads closer, so an
-    occluder shows up as a near-depth blob sitting on/inside the car.
+    bush, a cable, rebar) defeat that. A real occluder HIDES the car pixels behind
+    it, so it appears as a HOLE in the car silhouette whose depth is much CLOSER
+    than the car. We detect exactly that: scan the holes inside the car's convex
+    hull and flag the ones that read closer than the (extrapolated) car surface.
 
-    Robustness steps, in order, against the obvious false positives:
-      1. PLANE-DETREND the car's natural front-to-back depth gradient (the near
-         bumper is genuinely closer than the far one) by fitting z = ax+by+c to the
-         depth over the actual CAR pixels; we threshold on the residual, not the raw
-         distance to the car's mean depth.
-      2. require the pixel to be closer than that fitted surface by `occlusion_
-         depth_margin` (absorbs depth noise; leans toward real occlusion).
-      3. ERODE the outlier map to peel the thin depth-halo on the car's own edge.
-      4. keep only BLOBS >= `occlusion_min_area_ratio` (drops halo / pixel noise).
-      5. keep only blobs that BORDER the car mask -- a true occluder sits against
-         the car; this drops hull "overspill" into unrelated foreground at the
-         hull's edge that is not actually on the car.
+    Why scan only the HOLES, never the car pixels: a car is NOT planar. Viewed
+    head-on, the hood/grille bulge toward the camera relative to a plane fit
+    dominated by the windshield/roof, so plane-detrending the CAR pixels still
+    leaves them "closer than expected" -> false positives on a perfectly clean car.
+    A genuine occluder is never labelled car, so restricting to non-car holes both
+    removes those false positives and means the plane only has to extrapolate the
+    expected car depth a short way INTO a hole (which a plane does fine locally).
+
+    Steps:
+      1. HULL: fill the convex hull of the car mask -> the region the car occupies
+         including the holes an occluder punches into its silhouette.
+      2. PLANE: fit z = ax+by+c to the depth over the CAR pixels -> the expected
+         car-surface depth, extrapolated across the image.
+      3. HOLES: scan hull pixels that are NOT car (not in the SAM car mask nor the
+         vehicle silhouette). The car's own bulging body is excluded here.
+      4. CLOSER: keep hole pixels closer than the fitted surface by `occlusion_
+         depth_margin` -- a strong margin, the main false-positive guard.
+      5. NEAR + SIZE: keep only those within a band around the car and judge by
+         TOTAL area >= `occlusion_min_area_ratio` (summed, so a wispy occluder that
+         fragments into many specks still registers).
 
     Depth convention: depth_map is METRIC -> SMALLER = CLOSER, so a closer-than-car
     pixel has expected_depth - depth_map > 0.
+
+    Known residual caveat: ground in front of the car that falls inside the hull
+    (e.g. just under the bumper) can also read closer; the band + margin + min-area
+    suppress most of it, but raise `occlusion_depth_margin` if it leaks through.
 
     Returns (found, occlusion_mask_bin) -- occlusion_mask_bin is a boolean (H, W)
     map of the flagged outlier pixels (all-False when nothing is found).
@@ -233,17 +244,27 @@ def find_occlusion_obstacles(car, depth_map, config=None):
     expected = a * xx + b * yy + c                 # the car surface, extrapolated
     closer_amt = expected - depth_map              # > 0 => closer than the car
 
+    # --- holes only: hull pixels that are NOT genuine car surface ---------------
+    # A real occluder hides car pixels, so it is never labelled car. Excluding the
+    # car (SAM car mask + vehicle silhouette) skips the car's own non-planar body
+    # (the hood/grille bulge that a plane fit cannot capture) and leaves just the
+    # holes an occluder punches into the silhouette.
+    car_region = car_mask_bin
+    veh = car.get("vehicle_mask_bin")
+    if veh is not None:
+        car_region = car_region | veh
+    holes = hull_bin & ~car_region
+
     margin = car_depth * cfg.occlusion_depth_margin
-    outlier = hull_bin & (closer_amt > margin)
+    outlier = holes & (closer_amt > margin)
     if not outlier.any():
-        print("[INFO] Occlusion pass - no depth outliers in the car region.")
+        print("[INFO] Occlusion pass - no closer-than-car depth outliers in the silhouette holes.")
         return False, empty
 
     # --- restrict to outliers ON/AGAINST the car --------------------------------
-    # The occluder sits on the car, so we keep only outlier pixels inside a band
-    # around the car silhouette. This drops hull "overspill" (the far building seen
-    # through a hull corner) while still covering occlusion holes punched INTO the
-    # silhouette (the occluder hid those car pixels, but they are within the band).
+    # Keep only outlier pixels inside a band around the car silhouette. This drops
+    # hull "overspill" (a far building / ground seen through a hull corner, away
+    # from the car) while still covering occlusion holes adjacent to the car.
     band_px = max(3, int(round(min(H, W) * cfg.occlusion_band_ratio)))
     car_band = cv2.dilate(car_mask_bin.astype(np.uint8),
                           np.ones((band_px * 2 + 1,) * 2, np.uint8)).astype(bool)
