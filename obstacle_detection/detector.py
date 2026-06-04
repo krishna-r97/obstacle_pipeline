@@ -1,14 +1,29 @@
 """Obstacle-decision logic and end-to-end pipeline orchestration.
 
-`find_obstacle(...)` is the pure decision: given SAM masks, the depth map and the
-car region, it returns whether any mask is an obstacle blocking the car. It is
+`find_obstacles(...)` is the pure decision: given SAM masks, the depth map and the
+car mask, it returns which masks are obstacles overlapping the car. It is
 model-agnostic and easy to unit-test.
 
 `run_pipeline(image_path)` wires the models together: run SAM + vehicle + DA3,
-identify the car region (SAM-mask based), call `find_obstacle`, and package a
-result dict (including the visualization panels) for the notebook / Gradio app.
+identify the car SAM mask (best overlap with the vehicle bbox), call
+`find_obstacles`, and package a result dict (including the visualization panels)
+for the notebook / Gradio app.
 
-Depth convention: depth_map is METRIC depth -> SMALLER = CLOSER.
+Decision logic (one image, after the car SAM mask is chosen):
+    1. car_depth = average depth of the car mask -> foreground/background split.
+    2. For every other SAM mask:
+         - skip specks (min_area_ratio),
+         - skip the car's own PARTS: masks sitting inside the vehicle silhouette
+           (wheels / windows / doors / lights) via `car_part_containment`,
+         - keep only FOREGROUND masks: closer than the car by `depth_margin`
+           (rejects the background, which is farther),
+         - skip the receding GROUND plane via the top-vs-bottom depth delta,
+         - flag as an OBSTACLE if it overlaps the car mask by >= `min_car_overlap`
+           (fraction of the candidate mask's own pixels lying on the car).
+    Several masks can qualify -> a list of obstacle indices is returned.
+
+Depth convention: depth_map is METRIC depth -> SMALLER = CLOSER. A foreground
+object therefore has a depth SMALLER than the car's.
 """
 
 import cv2
@@ -26,134 +41,118 @@ from depth_anything_3.utils.visualize import visualize_depth
 # ---------------------------------------------------------------------------
 # Core decision (pure: numpy in, verdict out)
 # ---------------------------------------------------------------------------
-def find_obstacle(sam_masks, depth_map, car, config=None):
-    """Return (obstacle_exist, obstacle_mask_idx).
+def find_obstacles(sam_masks, depth_map, car, config=None):
+    """Return (obstacle_exist, obstacle_indices).
 
-    A SAM mask is an obstacle only if it survives EVERY check (see ObstacleConfig):
-    not background (behind the car), bbox-overlaps the car, is not a car sub-part,
-    is in real CONTACT with the car silhouette, and is not the ground plane.
+    A SAM mask is an obstacle iff it is NOT a car part (not inside the vehicle
+    silhouette), is FOREGROUND (closer than the car), is not the receding ground
+    plane, and overlaps the car mask by >= min_car_overlap.
 
     Parameters
     ----------
     sam_masks : np.ndarray (N, H, W)   SAM2 masks at depth-map resolution.
-    depth_map : np.ndarray (H, W)      Metric depth.
+    depth_map : np.ndarray (H, W)      Metric depth (smaller = closer).
     car : dict                         Output of car.identify_car_region(...).
     config : ObstacleConfig | None
     """
     cfg = config or ObstacleConfig()
     car_mask_bin = car["car_mask_bin"]
-    car_part_indices = car["car_part_indices"]
+    vehicle_mask_bin = car.get("vehicle_mask_bin")
+    car_idx = car["car_idx"]
     car_depth = car["car_depth"]
 
-    car_y, car_x = np.where(car_mask_bin)
-    car_min_x, car_max_x = car_x.min(), car_x.max()
-    car_min_y, car_max_y = car_y.min(), car_y.max()
-    car_width = max(car_max_x - car_min_x, 1)
-    car_height = max(car_max_y - car_min_y, 1)
+    # Reference used to recognise the car's own PARTS. The vehicle silhouette is
+    # the whole car (body + wheels + windows + lights); a SAM mask sitting inside
+    # it is a car part. Fall back to the SAM car mask when no vehicle mask exists.
+    car_part_ref = vehicle_mask_bin if vehicle_mask_bin is not None else car_mask_bin
 
     img_h, img_w = depth_map.shape
     img_area = img_h * img_w
-    background_thresh = car_depth * cfg.background_ratio
+    foreground_thresh = car_depth * (1.0 - cfg.depth_margin)   # must be CLOSER than this
 
-    # Ring kernel for the SAM-mask adjacency (contact) test.
-    adj_band = max(3, int(round(cfg.adjacency_band_frac * min(img_h, img_w))))
-    adj_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (adj_band, adj_band))
-
+    obstacle_indices = []
     for i, s_mask in enumerate(sam_masks):
-        if i in car_part_indices:
+        if i == car_idx:
             continue
 
         s_bin = s_mask > 0.5
-        mask_area = s_bin.sum()
+        mask_area = int(s_bin.sum())
         if mask_area == 0:
             continue
         if mask_area < img_area * cfg.min_area_ratio:
             print(f"[INFO] Skipping Mask {i} - Too small (area_ratio: {mask_area / img_area:.4f})")
             continue
 
-        # --- BACKGROUND rejection: clearly BEHIND the car (larger metric depth) ---
-        mask_depth = np.median(depth_map[s_bin])
-        if mask_depth > background_thresh:
-            print(f"[INFO] Skipping Mask {i} - Background / behind car "
-                  f"(depth: {mask_depth:.3f} > thresh: {background_thresh:.3f}, car: {car_depth:.3f})")
-            continue
-
-        ys, xs = np.where(s_bin)
-        min_x, max_x, min_y, max_y = xs.min(), xs.max(), ys.min(), ys.max()
-        mask_w, mask_h = max(max_x - min_x, 1), max(max_y - min_y, 1)
-
-        # --- bbox overlap (cheap pre-filter, normalised by the smaller extent) ---
-        x_ov = max(0, min(max_x, car_max_x) - max(min_x, car_min_x))
-        y_ov = max(0, min(max_y, car_max_y) - max(min_y, car_min_y))
-        x_ratio = x_ov / min(car_width, mask_w)
-        y_ratio = y_ov / min(car_height, mask_h)
-        if x_ratio < cfg.min_overlap_ratio or y_ratio < cfg.min_overlap_ratio:
-            print(f"[INFO] Skipping Mask {i} - Insufficient bbox overlap "
-                  f"(x: {x_ratio:.2%}, y: {y_ratio:.2%})")
-            continue
-
-        # --- car-part check: most of THIS mask sits on the car -> sub-part ---
-        mask_overlap_ratio = np.logical_and(s_bin, car_mask_bin).sum() / mask_area
-        if mask_overlap_ratio > cfg.max_car_pix_overlap:
-            print(f"[INFO] Skipping Mask {i} - High pixel overlap with car "
-                  f"({mask_overlap_ratio:.3f}) -> car part")
-            continue
-
-        # --- SAM-mask adjacency (real contact) ---
-        # Dilate the candidate into a ring and measure what fraction lands on the
-        # car SAM mask. An occluding object is in FRONT of the car (separate,
-        # abutting mask), so contact -- not raw intersection -- is the right signal.
-        ring = np.logical_and(cv2.dilate(s_bin.astype(np.uint8), adj_kernel).astype(bool), ~s_bin)
-        ring_area = ring.sum()
-        car_adjacency = np.logical_and(ring, car_mask_bin).sum() / ring_area if ring_area > 0 else 0.0
-        if car_adjacency < cfg.min_car_adjacency:
-            print(f"[INFO] Skipping Mask {i} - Not in contact with car SAM mask "
-                  f"(adjacency: {car_adjacency:.3f} < {cfg.min_car_adjacency}) -> beside the car")
-            continue
-
-        # --- ground-plane check: receding plane is far at top, near at bottom ---
-        mid_y = (min_y + max_y) / 2.0
-        top, bot = ys < mid_y, ys >= mid_y
-        if top.any() and bot.any():
-            top_d = np.median(depth_map[ys[top], xs[top]])
-            bot_d = np.median(depth_map[ys[bot], xs[bot]])
-            grad_ratio = (top_d - bot_d) / (car_depth + 1e-6)
-            print(f"[INFO] Mask {i} - top_depth: {top_d:.3f}, bottom_depth: {bot_d:.3f}, "
-                  f"grad_ratio: {grad_ratio:.3f}")
-            if grad_ratio > cfg.ground_grad_ratio:
-                print(f"[INFO] Skipping Mask {i} - Identified as ground plane "
-                      f"(grad_ratio: {grad_ratio:.3f})")
+        # --- CAR-PART test: mask sits inside the vehicle silhouette ------------
+        # Wheels / windows / doors / lights are part OF the car. A foreign object
+        # occluding the car is NOT in the vehicle mask, so its containment is ~0.
+        if car_part_ref is not None:
+            part_containment = np.logical_and(s_bin, car_part_ref).sum() / mask_area
+            if part_containment > cfg.car_part_containment:
+                print(f"[INFO] Skipping Mask {i} - Car part "
+                      f"(inside vehicle silhouette: {part_containment:.2%} > "
+                      f"{cfg.car_part_containment:.0%})")
                 continue
 
-        # --- wide mask hugging the bottom = ground catch-all ---
-        if max_y > img_h * cfg.bottom_touch_frac and (max_x - min_x) / img_w > cfg.bottom_width_frac:
-            print(f"[INFO] Skipping Mask {i} - Wide mask touching bottom")
+        # --- FOREGROUND test: must be closer than the car ---------------------
+        # Rejects the background (farther than the car).
+        mask_depth = float(np.mean(depth_map[s_bin]))
+        if mask_depth >= foreground_thresh:
+            kind = "background / behind car" if mask_depth > car_depth else "at car depth"
+            print(f"[INFO] Skipping Mask {i} - Not foreground ({kind}) "
+                  f"(depth: {mask_depth:.3f} >= {foreground_thresh:.3f}, car: {car_depth:.3f})")
             continue
 
-        # Survived every filter -> genuine obstacle blocking the car.
-        print(f"[RESULT] Obstacle found! Mask {i}, Depth: {mask_depth:.3f} (car {car_depth:.3f}), "
-              f"overlap x: {x_ratio:.2%} y: {y_ratio:.2%}, adjacency: {car_adjacency:.3f}")
-        return True, i
+        # --- GROUND-plane test: vertical top-vs-bottom depth delta ------------
+        # A receding ground/floor mask is far at top, near at bottom -> large
+        # positive delta. An upright obstacle's delta is ~0.
+        ys, xs = np.where(s_bin)
+        mid_y = (ys.min() + ys.max()) / 2.0
+        top, bot = ys < mid_y, ys >= mid_y
+        if top.any() and bot.any():
+            top_d = float(np.median(depth_map[ys[top], xs[top]]))
+            bot_d = float(np.median(depth_map[ys[bot], xs[bot]]))
+            delta_ratio = (top_d - bot_d) / (mask_depth + 1e-6)
+            print(f"[INFO] Mask {i} - top_depth: {top_d:.3f}, bottom_depth: {bot_d:.3f}, "
+                  f"delta_ratio: {delta_ratio:.3f}")
+            if delta_ratio > cfg.ground_grad_ratio:
+                print(f"[INFO] Skipping Mask {i} - Ground plane "
+                      f"(delta_ratio: {delta_ratio:.3f} > {cfg.ground_grad_ratio})")
+                continue
 
-    return False, -1
+        # --- OBSTACLE test: pixel overlap with the car mask -------------------
+        car_overlap = np.logical_and(s_bin, car_mask_bin).sum() / mask_area
+        if car_overlap < cfg.min_car_overlap:
+            print(f"[INFO] Skipping Mask {i} - Insufficient overlap with car "
+                  f"({car_overlap:.2%} < {cfg.min_car_overlap:.0%})")
+            continue
+
+        print(f"[RESULT] Obstacle found! Mask {i}, depth: {mask_depth:.3f} "
+              f"(car {car_depth:.3f}), car overlap: {car_overlap:.2%}")
+        obstacle_indices.append(i)
+
+    return len(obstacle_indices) > 0, obstacle_indices
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _vehicle_region(veh_res, img_h, img_w):
-    """Binary vehicle region from the vehicle model result (mask preferred, else
-    bbox). Returns None when nothing was detected."""
+    """Binary vehicle region from the vehicle model result, used to pick AND clip
+    the car SAM mask. The segmentation MASK (a precise car silhouette) is preferred;
+    the bbox rectangle is only a fallback -- the rectangle pulls in ground/corner
+    pixels, which made the car selection grab the ground the car sits on. Returns
+    None when nothing was detected."""
     n_veh = len(veh_res.instances) if hasattr(veh_res, "instances") else 0
     if n_veh == 0:
         return None
     veh_masks = veh_res.masks
-    veh_boxes = veh_res.bboxes
     if len(veh_masks) > 0:
         v_mask = veh_masks[0]
         if v_mask.shape != (img_h, img_w):
             v_mask = cv2.resize(v_mask.astype(np.uint8), (img_w, img_h), interpolation=cv2.INTER_NEAREST)
         return v_mask > 0.5
+    veh_boxes = veh_res.bboxes
     if len(veh_boxes) > 0:
         bx1, by1, bx2, by2 = map(int, veh_boxes[0])
         v_bin = np.zeros((img_h, img_w), dtype=bool)
@@ -175,7 +174,7 @@ def run_pipeline(image_path, models=None, config=None):
     Returns a result dict consumed by visualize.render_result_figure and the
     notebook plotting cell:
         obstacle_exist, original_img, sam_img, veh_img, da3_img,
-        obstacle_mask_idx, sam_masks, car_mask_idx
+        obstacle_mask_indices, sam_masks, car_mask_idx, car_mask_bin
     """
     print(f"[INFO] Processing {image_path}")
     cfg = config or ObstacleConfig()
@@ -206,43 +205,45 @@ def run_pipeline(image_path, models=None, config=None):
                 _resize_to(veh_img, ow, oh),
                 _resize_to(da3_img, ow, oh))
 
-    def _no_car_result():
+    def _empty_result():
         sam_img, veh_img, da3_img = _viz_panels()
         return {
             "obstacle_exist": False,
             "original_img": original_img,
             "sam_img": sam_img, "veh_img": veh_img, "da3_img": da3_img,
-            "obstacle_mask_idx": -1,
+            "obstacle_mask_indices": [],
             "sam_masks": sam_masks,
             "car_mask_idx": -1,
+            "car_mask_bin": None,
         }
 
     if len(sam_masks) == 0:
         print("[WARN] SAM produced no masks.")
-        return _no_car_result()
+        return _empty_result()
 
     # Resize SAM masks to the depth-map resolution if needed.
     if sam_masks.shape[1:] != (img_h, img_w):
         sam_masks = np.array([cv2.resize(m.astype(np.uint8), (img_w, img_h),
                                          interpolation=cv2.INTER_NEAREST) for m in sam_masks])
 
-    # Identify the car region (SAM-mask based; vehicle model only seeds it).
-    v_mask_bin = _vehicle_region(veh_res, img_h, img_w)
-    car = identify_car_region(sam_masks, depth_map, v_mask_bin)
+    # Pick the car SAM mask (best overlap with the vehicle bbox; SAM-only fallback).
+    v_region_bin = _vehicle_region(veh_res, img_h, img_w)
+    car = identify_car_region(sam_masks, depth_map, v_region_bin)
     if car is None:
         print("[WARN] No car found in the image.")
-        return _no_car_result()
-    print(f"[INFO] Car region (SAM2, {car['seed_src']}) = masks {sorted(car['car_part_indices'])} "
-          f"(seed {car['seed_idx']}, IoU {car['best_iou']:.3f}) | depth: {car['car_depth']:.3f}")
+        return _empty_result()
+    print(f"[INFO] Car = SAM mask {car['car_idx']} ({car['seed_src']}, "
+          f"IoU {car['best_iou']:.3f}) | avg depth: {car['car_depth']:.3f}")
 
-    obstacle_exist, obstacle_mask_idx = find_obstacle(sam_masks, depth_map, car, cfg)
+    obstacle_exist, obstacle_mask_indices = find_obstacles(sam_masks, depth_map, car, cfg)
 
     sam_img, veh_img, da3_img = _viz_panels()
     return {
         "obstacle_exist": obstacle_exist,
         "original_img": original_img,
         "sam_img": sam_img, "veh_img": veh_img, "da3_img": da3_img,
-        "obstacle_mask_idx": obstacle_mask_idx,
+        "obstacle_mask_indices": obstacle_mask_indices,
         "sam_masks": sam_masks,
-        "car_mask_idx": car["seed_idx"],
+        "car_mask_idx": car["car_idx"],
+        "car_mask_bin": car["car_mask_bin"],
     }

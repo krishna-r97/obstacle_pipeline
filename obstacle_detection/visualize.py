@@ -13,18 +13,36 @@ import matplotlib
 import matplotlib.pyplot as plt
 from PIL import Image
 
+CAR_COLOR = np.array([0, 200, 255])      # cyan  -> the chosen car mask
+OBSTACLE_COLOR = np.array([255, 0, 0])   # red   -> obstacle masks
+
+
+def _resize_mask(mask, ow, oh):
+    return cv2.resize(mask.astype(np.uint8), (ow, oh), interpolation=cv2.INTER_NEAREST).astype(bool)
+
 
 def obstacle_overlay(result):
-    """Return the original image with the detected obstacle mask painted red, or a
-    black frame when no obstacle was found."""
+    """Return the original image with the CAR mask painted cyan and every detected
+    OBSTACLE mask painted red. (Obstacles drawn last so they win on overlap.)"""
     oh, ow = result["original_img"].shape[:2]
-    if result["obstacle_exist"] and result["obstacle_mask_idx"] >= 0:
-        mask = result["sam_masks"][result["obstacle_mask_idx"]] > 0.5
-        mask = cv2.resize(mask.astype(np.uint8), (ow, oh), interpolation=cv2.INTER_NEAREST).astype(bool)
-        overlay = result["original_img"].copy()
-        overlay[mask] = (overlay[mask] * 0.4 + np.array([255, 0, 0]) * 0.6).astype(np.uint8)
-        return overlay
-    return np.zeros((oh, ow, 3), dtype=np.uint8)
+    overlay = result["original_img"].copy()
+    sam_masks = result["sam_masks"]
+
+    # Prefer the CLEANED car mask (clipped to the vehicle silhouette); fall back to
+    # the raw SAM blob only if it is missing.
+    car_mask_bin = result.get("car_mask_bin")
+    car_idx = result.get("car_mask_idx", -1)
+    if car_mask_bin is None and car_idx is not None and car_idx >= 0:
+        car_mask_bin = sam_masks[car_idx] > 0.5
+    if car_mask_bin is not None:
+        car_mask = _resize_mask(car_mask_bin, ow, oh)
+        overlay[car_mask] = (overlay[car_mask] * 0.5 + CAR_COLOR * 0.5).astype(np.uint8)
+
+    for idx in result.get("obstacle_mask_indices", []):
+        obs_mask = _resize_mask(sam_masks[idx] > 0.5, ow, oh)
+        overlay[obs_mask] = (overlay[obs_mask] * 0.4 + OBSTACLE_COLOR * 0.6).astype(np.uint8)
+
+    return overlay
 
 
 def render_result_figure(result, dpi=200):
@@ -39,11 +57,12 @@ def render_result_figure(result, dpi=200):
     axes[3].imshow(result["da3_img"]); axes[3].set_title("Depth Map")
 
     axes[4].imshow(obstacle_overlay(result))
-    if result["obstacle_exist"] and result["obstacle_mask_idx"] >= 0:
-        axes[4].set_title(f"Obstacle Mask (#{result['obstacle_mask_idx']})",
-                          color="red", fontweight="bold")
+    obstacle_indices = result.get("obstacle_mask_indices", [])
+    if result["obstacle_exist"] and obstacle_indices:
+        ids = ", ".join(f"#{i}" for i in obstacle_indices)
+        axes[4].set_title(f"Car (cyan) + Obstacle(s) {ids}", color="red", fontweight="bold")
     else:
-        axes[4].set_title("No Obstacle Detected", color="green", fontweight="bold")
+        axes[4].set_title("Car (cyan) - No Obstacle", color="green", fontweight="bold")
 
     for ax in axes:
         ax.axis("off")

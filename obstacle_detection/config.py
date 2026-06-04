@@ -7,11 +7,14 @@ Everything you are likely to TUNE or RE-POINT lives here:
 Import the thresholds as a single object so callers stay tidy:
 
     from obstacle_detection.config import ObstacleConfig
-    cfg = ObstacleConfig()              # defaults
-    cfg = ObstacleConfig(min_car_adjacency=0.08)   # override one knob
+    cfg = ObstacleConfig()                  # defaults
+    cfg = ObstacleConfig(min_car_overlap=0.10)   # override one knob
 
 Depth convention reminder (used throughout the package):
-    depth_map is METRIC depth (meters) -> SMALLER value = CLOSER to the camera.
+    `da3_res.depth` is METRIC depth (meters) -> SMALLER value = CLOSER to camera.
+    A FOREGROUND object (between the camera and the car) therefore has a depth
+    SMALLER than the car's average depth. (In the *depth visualization* it looks
+    brighter/warmer, i.e. a larger displayed value -- same thing, opposite sign.)
 """
 
 import os
@@ -31,43 +34,48 @@ OBSTACLE_IMAGES_DIR = os.path.join(TEST_IMAGES_DIR, "obstacle")
 class ObstacleConfig:
     """Tunable thresholds for the obstacle-decision logic.
 
-    A SAM mask is flagged as an obstacle only if it survives EVERY check below.
+    The decision (see detector.find_obstacles) is, for every SAM mask that is
+    not the car mask:
+        1. drop specks                     (min_area_ratio)
+        2. drop the car's own PARTS        (car_part_containment) -- masks that sit
+           inside the vehicle silhouette (wheels / windows / doors / lights).
+        3. keep only FOREGROUND masks      (depth_margin) -- closer than the car;
+           rejects the background (farther).
+        4. drop the receding GROUND plane  (ground_grad_ratio) via the vertical
+           top-vs-bottom depth delta.
+        5. flag as an OBSTACLE any mask whose pixels overlap the car mask by at
+           least `min_car_overlap`.
     The defaults are the values validated on the test_images/obstacle set.
     """
 
-    # Reject masks that are FARTHER than the car by more than this factor
-    # (i.e. clearly BEHIND the car -> background: walls, roof, far parked cars).
-    background_ratio: float = 1.10
-
-    # Minimum bounding-box overlap with the car on BOTH axes, normalised by the
-    # smaller of car/obstacle extent. Cheap coarse pre-filter only -- the real
-    # gate is `min_car_adjacency`. A thin pole inside the car footprint still
-    # passes because of the min-extent normalisation.
-    min_overlap_ratio: float = 0.30
-
-    # If MORE than this fraction of an obstacle mask's pixels sit on the car
-    # region, it is a car sub-part (window / wheel / door), not an obstacle.
-    max_car_pix_overlap: float = 0.50
-
-    # Minimum fraction of the obstacle SAM mask's BORDER that must touch the car
-    # SAM mask (real contact). Bounding-box overlap alone is too loose -- the car
-    # bbox spans the frame, so objects merely BESIDE the car pass it. A genuine
-    # obstruction is in contact with the car silhouette (a pole has car body on
-    # both sides; an object at the bumper borders the car above it).
-    min_car_adjacency: float = 0.12
-
-    # Width of the dilation ring (as a fraction of the image's short side) used
-    # to measure `min_car_adjacency`.
-    adjacency_band_frac: float = 0.02
-
-    # Vertical depth gradient (top-vs-bottom, as a fraction of car depth) above
-    # which a mask is the receding GROUND plane rather than an upright obstacle.
-    ground_grad_ratio: float = 0.15
-
     # Ignore specks smaller than this fraction of the image area (kept low so
-    # thin poles survive).
+    # thin poles / small bricks still survive).
     min_area_ratio: float = 0.0015
 
-    # A wide mask hugging the very bottom of the frame is the ground catch-all.
-    bottom_touch_frac: float = 0.95   # max_y must exceed this fraction of height
-    bottom_width_frac: float = 0.40   # ...and span more than this fraction of width
+    # CAR-PART rejection. A SAM mask with at least this fraction of its pixels
+    # inside the vehicle silhouette (the vehicle model's segmentation mask) is a
+    # part OF the car -- a wheel / window / door / light / spoiler that SAM
+    # segmented separately -- NOT an obstacle. Depth alone is not enough: the near
+    # wheel can read slightly closer than the car-body average and slip through the
+    # foreground test, so we also use the vehicle mask geometrically. A foreign
+    # object occluding the car is NOT in the vehicle mask, so its containment is
+    # ~0 and it survives this filter.
+    car_part_containment: float = 0.5
+
+    # FOREGROUND test. A mask counts as foreground only if it is at least this
+    # fraction CLOSER than the car, i.e. mask_depth < car_depth * (1 - depth_margin).
+    # Masks at or beyond the car's depth (background, or car parts at the same
+    # depth) are rejected here; the small margin also absorbs depth noise.
+    depth_margin: float = 0.05
+
+    # GROUND-plane rejection. A receding ground/floor mask is far at its top and
+    # near at its bottom, so its vertical depth delta
+    #     (median_depth(top half) - median_depth(bottom half)) / mask_depth
+    # is large and positive. Above this ratio the mask is treated as ground, not
+    # an upright obstacle. An upright obstacle has a near-zero delta.
+    ground_grad_ratio: float = 0.15
+
+    # OBSTACLE test. Fraction of the candidate mask's OWN pixels that must fall on
+    # the car mask. >= 5% overlap -> the foreground object is on/against the car
+    # silhouette and is flagged as an obstacle. There can be several such masks.
+    min_car_overlap: float = 0.05

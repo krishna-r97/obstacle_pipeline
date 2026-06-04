@@ -10,15 +10,15 @@ Public API:
 Module map (where to find / edit things):
     config.py     - server paths + all tunable thresholds (ObstacleConfig)
     models.py     - load + cache SAM / vehicle / DA3 (get_models, reset_models)
-    car.py        - identify the car region from SAM2 masks
-    detector.py   - obstacle-decision logic (find_obstacle) + run_pipeline
+    car.py        - identify the car SAM mask (best overlap with the vehicle bbox)
+    detector.py   - obstacle-decision logic (find_obstacles) + run_pipeline
     visualize.py  - 5-panel figure rendering
 """
 
 from .config import ObstacleConfig, BASE_PATH, OBSTACLE_IMAGES_DIR, TEST_IMAGES_DIR
 from .models import get_models, reset_models
 from .car import identify_car_region
-from .detector import run_pipeline, find_obstacle
+from .detector import run_pipeline, find_obstacles
 from .visualize import render_result_figure, obstacle_overlay
 
 __all__ = [
@@ -30,7 +30,7 @@ __all__ = [
     "reset_models",
     "identify_car_region",
     "run_pipeline",
-    "find_obstacle",
+    "find_obstacles",
     "render_result_figure",
     "obstacle_overlay",
 ]
