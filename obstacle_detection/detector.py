@@ -18,8 +18,8 @@ Decision logic (one image, after the car SAM mask is chosen):
          - keep only FOREGROUND masks: closer than the car by `depth_margin`
            (rejects the background, which is farther),
          - skip the receding GROUND plane via the top-vs-bottom depth delta,
-         - flag as an OBSTACLE if it overlaps the car mask by >= `min_car_overlap`
-           (fraction of the candidate mask's own pixels lying on the car).
+         - flag as an OBSTACLE if it TOUCHES the car mask (any pixel overlapping
+           or adjacent to it; the car mask is dilated 1px for the adjacency test).
     Several masks can qualify -> a list of obstacle indices is returned.
 
 Depth convention: depth_map is METRIC depth -> SMALLER = CLOSER. A foreground
@@ -87,7 +87,7 @@ def find_obstacles(sam_masks, depth_map, car, config=None):
 
     A SAM mask is an obstacle iff it is NOT a car part (not inside the vehicle
     silhouette), is FOREGROUND (closer than the car), is not the receding ground
-    plane, and overlaps the car mask by >= min_car_overlap.
+    plane, and TOUCHES the car mask (overlapping or adjacent).
 
     Parameters
     ----------
@@ -110,6 +110,11 @@ def find_obstacles(sam_masks, depth_map, car, config=None):
     img_h, img_w = depth_map.shape
     img_area = img_h * img_w
     foreground_thresh = car_depth * (1.0 - cfg.depth_margin)   # must be CLOSER than this
+
+    # Dilate the car mask by 1px so masks that are adjacent (touching) but not
+    # strictly overlapping still count as touching the car.
+    car_touch_ref = cv2.dilate(car_mask_bin.astype(np.uint8),
+                               np.ones((3, 3), np.uint8), iterations=1).astype(bool)
 
     obstacle_indices = []
     for i, s_mask in enumerate(sam_masks):
@@ -161,15 +166,15 @@ def find_obstacles(sam_masks, depth_map, car, config=None):
                       f"(delta_ratio: {delta_ratio:.3f} > {cfg.ground_grad_ratio})")
                 continue
 
-        # --- OBSTACLE test: pixel overlap with the car mask -------------------
-        car_overlap = np.logical_and(s_bin, car_mask_bin).sum() / mask_area
-        if car_overlap < cfg.min_car_overlap:
-            print(f"[INFO] Skipping Mask {i} - Insufficient overlap with car "
-                  f"({car_overlap:.2%} < {cfg.min_car_overlap:.0%})")
+        # --- OBSTACLE test: any pixel touching the car mask -------------------
+        # A mask that overlaps or merely abuts the car is an obstacle (the old
+        # fractional min_car_overlap threshold is replaced by a simple touch test).
+        if not np.logical_and(s_bin, car_touch_ref).any():
+            print(f"[INFO] Skipping Mask {i} - Does not touch the car mask")
             continue
 
         print(f"[RESULT] Obstacle found! Mask {i}, depth: {mask_depth:.3f} "
-              f"(car {car_depth:.3f}), car overlap: {car_overlap:.2%}")
+              f"(car {car_depth:.3f}), touches the car")
         obstacle_indices.append(i)
 
     return len(obstacle_indices) > 0, obstacle_indices

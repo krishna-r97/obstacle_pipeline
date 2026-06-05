@@ -43,8 +43,8 @@ class ObstacleConfig:
            rejects the background (farther).
         4. drop the receding GROUND plane  (ground_grad_ratio) via the vertical
            top-vs-bottom depth delta.
-        5. flag as an OBSTACLE any mask whose pixels overlap the car mask by at
-           least `min_car_overlap`.
+        5. flag as an OBSTACLE any mask that TOUCHES the car mask (any pixel
+           overlapping or adjacent to it; the car mask is dilated 1px).
     The defaults are the values validated on the test_images/obstacle set.
     """
 
@@ -75,9 +75,9 @@ class ObstacleConfig:
     # an upright obstacle. An upright obstacle has a near-zero delta.
     ground_grad_ratio: float = 0.15
 
-    # OBSTACLE test. Fraction of the candidate mask's OWN pixels that must fall on
-    # the car mask. >= 5% overlap -> the foreground object is on/against the car
-    # silhouette and is flagged as an obstacle. There can be several such masks.
+    # OBSTACLE test. DEPRECATED / unused: the decision now flags any mask that
+    # TOUCHES the car mask (overlapping or adjacent), so there is no fractional
+    # overlap threshold. Kept for backwards compatibility with existing configs.
     min_car_overlap: float = 0.05
 
     # -----------------------------------------------------------------------
