@@ -31,16 +31,19 @@ OBSTACLE_IMAGES_DIR = os.path.join(TEST_IMAGES_DIR, "obstacle")
 # ---------------------------------------------------------------------------
 # SAM model selection.
 # ---------------------------------------------------------------------------
-# The pipeline runs SAM in "segment everything" mode. Pick which SAM checkpoint
-# to load by setting SAM_MODEL; the whole pipeline (models.get_models ->
-# SAMHandler) switches variant from this one place.
+# Pick which SAM checkpoint to load by setting SAM_MODEL; the whole pipeline
+# (models.get_models -> SAMHandler) switches variant from this one place.
 #
 #   * "sam2.1" -> the pre-downloaded base checkpoint on the server (see CLAUDE.md).
+#                 Loaded via ultralytics' `SAM(weights)` and run in "segment
+#                 everything" mode (automatic mask generator over a point grid).
 #   * "sam3"   -> the bare name, which ultralytics resolves / auto-downloads.
-#
-# Both load through ultralytics' unified `SAM(weights)` entry point and run the
-# same automatic mask generator; SAMHandler probes the AMG coverage knobs and
-# falls back cleanly when a build (or variant) rejects them.
+#                 SAM3 has NO "segment everything" mode: the generic `SAM()` class
+#                 can't drive it that way (build_sam doesn't even list sam3.pt).
+#                 Instead SAMHandler loads SAM3SemanticPredictor and PROMPTS it
+#                 with a fixed list of obstacle concepts -- see
+#                 ObstacleConfig.sam3_text_prompts. So SAM3 returns masks only for
+#                 those named concepts, not for everything in the scene.
 SAM_MODELS = {
     "sam2.1": os.path.join(BASE_PATH, "sam2.1_b.pt"),
     "sam3":   "sam3.pt",
@@ -162,6 +165,28 @@ class ObstacleConfig:
 
     # Mask-stability cutoff. Lower than the ~0.95 default -> keep more masks.
     sam_stability_score_thresh: float = 0.90
+
+    # -----------------------------------------------------------------------
+    # SAM3 concept-prompt vocabulary (only used when SAM_MODEL == "sam3").
+    # -----------------------------------------------------------------------
+    # SAM3 has no "segment everything" mode -- it segments only what it is asked
+    # for. Instead of an AMG point grid, SAMHandler prompts SAM3 with this list of
+    # obstacle concepts, so SAM3 returns a mask per detected instance of these
+    # classes. The masks then feed the SAME downstream overlap/foreground logic as
+    # the SAM2 path. Add/remove concepts here to change what SAM3 looks for; keep
+    # them concrete nouns (SAM3 grounds open-vocabulary text). A tuple is used so
+    # the dataclass default stays immutable; SAMHandler converts it to a list.
+    sam3_text_prompts: tuple = (
+        "person", "child", "bicycle", "motorcycle", "stroller", "wheelchair",
+        "shopping cart", "trolley", "dog", "cat", "animal", "traffic cone",
+        "pole", "bollard", "trash can", "box", "bag", "ladder", "chair",
+        "plant", "bush", "ball", "toy",
+    )
+
+    # Confidence cutoff for SAM3 concept detections. Set at load time on the
+    # SAM3SemanticPredictor (it takes conf in its overrides), so changing it needs
+    # a reset_models() to take effect. Lower -> keep more marginal detections.
+    sam3_conf: float = 0.25
 
     # -----------------------------------------------------------------------
     # OCCLUSION depth-outlier detection (second, mask-independent mechanism).

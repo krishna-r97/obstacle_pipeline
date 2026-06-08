@@ -1,17 +1,26 @@
-"""SAM model handler (ultralytics SAM in 'segment everything' mode).
+"""SAM model handler -- one wrapper, two segmentation paradigms.
 
-Wraps `ultralytics.SAM` so SAM is a handler class like the vehicle / DA3 models,
-and lets the pipeline switch SAM variant (SAM 2.1 / SAM 3) from config. The
-variant is chosen by `config.SAM_MODEL`; pass `model=` / `weights=` to override.
+Wraps SAM so the pipeline can switch variant (SAM 2.1 / SAM 3) from config; the
+variant is chosen by `config.SAM_MODEL` (override with `model=` / `weights=`).
+The two variants are NOT interchangeable under the hood:
 
-The pipeline runs SAM with no box/point prompt, so ultralytics drives SAM's
-automatic mask generator (AMG): a regular grid of point prompts, then a
-confidence/stability filter. The coverage knobs (grid density, crop layers,
-cutoffs) live on `ObstacleConfig` and are passed through here -- but some
-ultralytics builds (or SAM variants) validate kwargs against the model cfg and
-REJECT them. We probe once on the first call and cache the answer on the instance
-so we only warn once and don't keep retrying the failing path; the fallback runs
-the plain default-density 'segment everything', so any variant still works.
+  * SAM 2.1 -> loaded via ultralytics' generic `SAM(weights)` and run in
+    "segment everything" mode: ultralytics' automatic mask generator (AMG) lays a
+    grid of point prompts, runs SAM at each, then filters by confidence/stability.
+    The coverage knobs (grid density, crop layers, cutoffs) live on
+    `ObstacleConfig`; some ultralytics builds validate kwargs and REJECT them, so
+    we probe once on the first call, cache the answer, and fall back to plain
+    default-density "segment everything".
+
+  * SAM 3 -> SAM3 has NO "segment everything" mode, and the generic `SAM()` class
+    cannot drive it that way (ultralytics' `build_sam` doesn't even list sam3.pt).
+    SAM3 only segments in response to a prompt, so we load the dedicated
+    `SAM3SemanticPredictor` and prompt it with a fixed list of obstacle concepts
+    (`ObstacleConfig.sam3_text_prompts`). It then returns a mask per detected
+    instance of those concepts -- NOT every object in the scene.
+
+Both paths return an ultralytics `Results` (with `.masks` / `.plot()`), so the
+downstream overlap/foreground logic in `detector` is identical for either variant.
 """
 
 from ultralytics import SAM
@@ -21,7 +30,7 @@ from ..config import ObstacleConfig, SAM_MODEL, sam_weights
 
 class SAMHandler:
     def __init__(self, model=None, weights=None, device=None):
-        """Load a SAM variant once via ultralytics.
+        """Load a SAM variant once.
 
         Parameters
         ----------
@@ -34,20 +43,45 @@ class SAMHandler:
         """
         self.model_name = model or SAM_MODEL
         self.weights = weights or sam_weights(self.model_name)
-        self.model = SAM(self.weights)
         self.device = device
+        self.is_sam3 = self.model_name == "sam3"
         # Whether this build/variant accepts SAM's AMG kwargs through model(...).
-        # None = not yet probed; set to True/False on the first segment_everything call.
+        # None = not yet probed; set to True/False on the first segment call.
+        # Only meaningful for the SAM2 (AMG) path.
         self._amg_supported = None
 
-    def segment_everything(self, source, config=None, device=None):
-        """Run SAM in 'segment everything' mode, applying the coverage knobs from
-        config when this build/variant supports them, else falling back cleanly.
+        if self.is_sam3:
+            # SAM3 is prompt-driven only -- load its dedicated semantic predictor.
+            # conf is fixed at load (the predictor takes it in overrides), so
+            # changing config.sam3_conf needs a reset_models() to re-load.
+            from ultralytics.models.sam import SAM3SemanticPredictor
+            cfg = ObstacleConfig()
+            overrides = dict(
+                model=self.weights,
+                conf=cfg.sam3_conf,
+                task="segment",
+                mode="predict",
+                half=True,          # FP16 for faster inference
+                verbose=False,
+            )
+            if device is not None:
+                overrides["device"] = device
+            self.model = SAM3SemanticPredictor(overrides=overrides)
+        else:
+            self.model = SAM(self.weights)
 
-        `source` may be an image path or an RGB numpy array. Returns the first
-        Results object.
+    def segment_everything(self, source, config=None, device=None):
+        """Produce the per-object masks the obstacle logic overlaps against.
+
+        For SAM 2.1 this runs true "segment everything" (AMG). For SAM 3 it
+        prompts the configured obstacle concepts -- same method name and same
+        return type (a `Results`) so callers don't branch. `source` may be an
+        image path or an RGB numpy array.
         """
         cfg = config or ObstacleConfig()
+        if self.is_sam3:
+            return self._segment_sam3(source, cfg)
+
         dev = device if device is not None else self.device
         base = dict(device=dev, verbose=False)
 
@@ -73,6 +107,15 @@ class SAMHandler:
                       f"predictor's generate() directly or upgrade ultralytics.")
             self._amg_supported = False
             return self.model(source, **base)[0]
+
+    def _segment_sam3(self, source, cfg):
+        """SAM3 concept segmentation: set the image once, then query the obstacle
+        concept list (`cfg.sam3_text_prompts`). Returns the first `Results`, whose
+        `.masks` / `.plot()` match the SAM2 path so downstream logic is unchanged.
+        """
+        self.model.set_image(source)
+        results = self.model(text=list(cfg.sam3_text_prompts))
+        return results[0] if isinstance(results, (list, tuple)) else results
 
     def infer(self, source, config=None, device=None):
         """Alias matching the other handler interfaces (e.g. DepthAnything3Handler)."""
