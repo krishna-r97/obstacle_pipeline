@@ -8,9 +8,10 @@ Public API:
     fig = render_result_figure(result)
 
 Module map (where to find / edit things):
-    config.py            - server paths + all tunable thresholds (ObstacleConfig)
-    handlers/            - one model-handler class per model (SAM2Handler,
-                           VehicleModelHandler, DepthAnything3Handler)
+    config.py            - server paths, SAM variant selection (SAM_MODEL), and all
+                           tunable thresholds (ObstacleConfig)
+    handlers/            - one model-handler class per model (SAMHandler -- SAM 2.1 /
+                           SAM 3 by config, VehicleModelHandler, DepthAnything3Handler)
     models.py            - load + cache the handlers (get_models, reset_models)
     car.py               - identify the car SAM mask (best overlap with vehicle region)
     rules.py             - obstacle-deciding HOOKS: per-mask filters (find_obstacles)
@@ -19,8 +20,11 @@ Module map (where to find / edit things):
     visualize.py         - 5-panel figure rendering
 """
 
-from .config import ObstacleConfig, BASE_PATH, OBSTACLE_IMAGES_DIR, TEST_IMAGES_DIR
-from .handlers import SAM2Handler, VehicleModelHandler, DepthAnything3Handler
+from .config import (
+    ObstacleConfig, BASE_PATH, OBSTACLE_IMAGES_DIR, TEST_IMAGES_DIR,
+    SAM_MODEL, SAM_MODELS, sam_weights,
+)
+from .handlers import SAMHandler, SAM2Handler, VehicleModelHandler, DepthAnything3Handler
 from .models import get_models, reset_models
 from .car import identify_car_region
 from .rules import find_obstacles, find_occlusion_obstacles
@@ -32,6 +36,10 @@ __all__ = [
     "BASE_PATH",
     "OBSTACLE_IMAGES_DIR",
     "TEST_IMAGES_DIR",
+    "SAM_MODEL",
+    "SAM_MODELS",
+    "sam_weights",
+    "SAMHandler",
     "SAM2Handler",
     "VehicleModelHandler",
     "DepthAnything3Handler",

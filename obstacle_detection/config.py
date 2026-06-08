@@ -25,9 +25,42 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 BASE_PATH = "/mnt/aitraining/krishna/2026/obstacle_pipeline"
 
-SAM_WEIGHTS = os.path.join(BASE_PATH, "sam2.1_b.pt")
 TEST_IMAGES_DIR = os.path.join(BASE_PATH, "test_images")
 OBSTACLE_IMAGES_DIR = os.path.join(TEST_IMAGES_DIR, "obstacle")
+
+# ---------------------------------------------------------------------------
+# SAM model selection.
+# ---------------------------------------------------------------------------
+# The pipeline runs SAM in "segment everything" mode. Pick which SAM checkpoint
+# to load by setting SAM_MODEL; the whole pipeline (models.get_models ->
+# SAMHandler) switches variant from this one place.
+#
+#   * "sam2.1" -> the pre-downloaded base checkpoint on the server (see CLAUDE.md).
+#   * "sam3"   -> the bare name, which ultralytics resolves / auto-downloads.
+#
+# Both load through ultralytics' unified `SAM(weights)` entry point and run the
+# same automatic mask generator; SAMHandler probes the AMG coverage knobs and
+# falls back cleanly when a build (or variant) rejects them.
+SAM_MODELS = {
+    "sam2.1": os.path.join(BASE_PATH, "sam2.1_b.pt"),
+    "sam3":   "sam3.pt",
+}
+
+# Active SAM variant -- change this to "sam3" to run SAM3 instead of SAM 2.1.
+SAM_MODEL = "sam2.1"
+
+
+def sam_weights(model_name=None):
+    """Resolve the SAM checkpoint path/name for a variant (defaults to SAM_MODEL)."""
+    name = model_name or SAM_MODEL
+    if name not in SAM_MODELS:
+        raise ValueError(f"Unknown SAM model {name!r}; choose from {list(SAM_MODELS)}")
+    return SAM_MODELS[name]
+
+
+# Backwards-compatible alias: the single weights path callers used before SAM3
+# support (resolves to whatever SAM_MODEL currently selects).
+SAM_WEIGHTS = sam_weights()
 
 
 @dataclass
