@@ -92,8 +92,16 @@ def run(image_path, sam_model):
         logging.warning("Run requested with no image uploaded.")
         return None, "Please upload an image."
     logging.info("Running pipeline on %s (SAM: %s)", image_path, sam_model)
-    models = _ensure_models(sam_model)
-    result = run_pipeline(image_path, models=models)
+    try:
+        models = _ensure_models(sam_model)
+        result = run_pipeline(image_path, models=models)
+    except Exception:
+        # Surface model/env failures (e.g. SAM3 needs torch>=2.3 for
+        # torch.nn.attention) as a UI message instead of crashing the request.
+        logging.exception("Pipeline failed for SAM model %s", sam_model)
+        reset_models()  # drop any half-initialised handler so the next run is clean
+        return None, (f"❌ '{sam_model}' failed in this environment. "
+                      f"Try SAM 2.1, or see log.log for details.")
     fig_img = render_result_figure(result)
     status = "⚠️ Obstacle detected" if result["obstacle_exist"] else "✅ No obstacle"
     logging.info("Pipeline done: %s", status)
