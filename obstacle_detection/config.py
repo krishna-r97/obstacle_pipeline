@@ -75,10 +75,30 @@ class ObstacleConfig:
     # an upright obstacle. An upright obstacle has a near-zero delta.
     ground_grad_ratio: float = 0.15
 
+    # A mask is only eligible to be GROUND if it spans most of the image width
+    # along the bottom -- the real floor/road does, a corner object (e.g. a
+    # finger poking in) does not. `ground_bottom_frac` defines the bottom band of
+    # the image (rows below this fraction of the height); `ground_min_bottom_width`
+    # is the fraction of the image width the mask must cover within that band.
+    ground_bottom_frac: float = 0.85
+    ground_min_bottom_width: float = 0.70
+
     # OBSTACLE test. DEPRECATED / unused: the decision now flags any mask that
     # TOUCHES the car mask (overlapping or adjacent), so there is no fractional
     # overlap threshold. Kept for backwards compatibility with existing configs.
     min_car_overlap: float = 0.05
+
+    # -----------------------------------------------------------------------
+    # RULE TOGGLES (hooks). Each obstacle filter can be turned off independently
+    # for debugging -- e.g. disable `enable_car_part_filter` when a finger/hand
+    # resting ON the car is being wrongly rejected as a car part. A disabled rule
+    # is skipped entirely (every mask passes it). See detector.OBSTACLE_RULES.
+    # -----------------------------------------------------------------------
+    enable_min_area_filter: bool = True     # drop specks (min_area_ratio)
+    enable_car_part_filter: bool = True     # drop car's own parts (car_part_containment)
+    enable_foreground_filter: bool = True   # keep only masks closer than the car (depth_margin)
+    enable_ground_filter: bool = True       # drop the receding ground plane (ground_grad_ratio)
+    enable_touch_filter: bool = True        # require the mask to touch the car mask
 
     # -----------------------------------------------------------------------
     # SAM2 "segment everything" coverage knobs.
