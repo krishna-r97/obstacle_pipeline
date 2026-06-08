@@ -1,0 +1,90 @@
+# Per-rule configuration for the obstacle-detection pipeline.
+#
+# One section per rule (mirrors detector.OBSTACLE_RULES). Each section's `enable`
+# toggles that rule on/off; the rest are its thresholds. Edit values here to tune
+# the pipeline WITHOUT touching Python -- ObstacleConfig.from_yaml() loads this and
+# overrides the dataclass defaults (config.py). Any key you omit keeps its default,
+# so this file may be partial. Unknown groups/keys raise an error (catches typos).
+#
+# Depth reminder: da3 depth is METRIC -> SMALLER value = CLOSER. A foreground
+# (obstacle) mask is closer than the car, i.e. depth < car_depth * (1 - margin).
+
+# 1. MIN-AREA: throw away tiny speck masks before any other test.
+min_area:
+  # Turn this rule on/off. Off = specks are NOT dropped (every mask passes).
+  enable: true
+  # Smallest mask kept, as a fraction of the whole image area. A mask with fewer
+  # pixels than this is treated as noise and discarded. LOWER = keep smaller things
+  # (thin poles, distant bricks) but more fragments; HIGHER = drop more clutter.
+  min_area_ratio: 0.0015
+
+# 2. CAR-PART: drop masks that are really pieces of the car itself.
+car_part:
+  # Turn this rule on/off. Off = wheels/windows/lights may be flagged as obstacles.
+  enable: true
+  # Fraction of a mask's pixels that must fall INSIDE the vehicle silhouette for it
+  # to count as a car part (and be dropped). 0.5 = "at least half inside". A foreign
+  # object occluding the car sits mostly OUTSIDE the silhouette, so it survives.
+  # LOWER = more aggressive (more masks called car parts); HIGHER = stricter.
+  car_part_containment: 0.5
+
+# 3. FOREGROUND: keep only masks CLOSER to the camera than the car.
+foreground:
+  # Turn this rule on/off. Off = background masks are not rejected on depth.
+  enable: true
+  # How much closer than the car a mask must be to count as foreground, as a
+  # fraction of the car's depth: kept only if mask_depth < car_depth * (1 - margin).
+  # Also absorbs depth noise. LOWER = let near-car-depth masks through (more
+  # sensitive); HIGHER = require things to be clearly in front of the car.
+  depth_margin: 0.05
+
+# 4. GROUND: drop the receding floor/road plane (it is near at the bottom, far at
+#    the top), but only if the mask also looks like a full-width ground strip.
+ground:
+  # Turn this rule on/off. Off = the ground plane is not specially rejected.
+  enable: true
+  # Vertical depth slope that marks a mask as ground: (top_depth - bottom_depth) /
+  # depth. A receding floor has a large positive value; an upright object ~0. Above
+  # this ratio the mask is called ground. LOWER = reject more sloped masks as ground
+  # (risk dropping tilted obstacles); HIGHER = only very steep planes count.
+  ground_grad_ratio: 0.15
+  # Defines the bottom band of the image as the rows BELOW this fraction of the
+  # height (0.85 = the lowest 15%). The width test below is measured in this band.
+  ground_bottom_frac: 0.85
+  # A mask is only ELIGIBLE to be ground if, within that bottom band, it spans at
+  # least this fraction of the image width -- the real floor does, a corner object
+  # (a finger poking in) does not. HIGHER = stricter (only very wide strips).
+  ground_min_bottom_width: 0.70
+
+# 5. TOUCH: the final verdict -- flag any surviving mask that touches the car.
+touch:
+  # Turn this rule on/off. Off = masks are NOT required to touch the car (anything
+  # that passed the earlier filters is flagged, even if it is far from the car).
+  # There is no threshold: the car mask is dilated 1px and any overlap counts.
+  enable: true
+
+# OCCLUSION: a second, mask-independent check. Scans the filled car region for
+# blobs whose depth is anomalously closer than the car's own (plane-detrended)
+# surface -- catches thin/wispy occluders SAM cannot segment. Its verdict is OR'd
+# with the rule-based verdict above.
+occlusion:
+  # Turn this mechanism on/off. Off = only the SAM-mask rules decide.
+  use_occlusion_depth: true
+  # How much closer than the car's surface a pixel must read to count as an
+  # occluder, as a fraction of the car's depth (after removing the car's natural
+  # front-to-back gradient). LOWER = more sensitive (may fire on glass/edges);
+  # HIGHER = stricter, fewer false positives.
+  occlusion_depth_margin: 0.08
+  # Minimum TOTAL outlier area (summed over all qualifying pixels), as a fraction of
+  # the image area, before calling it an occluder. Summed (not one blob) so a wispy
+  # occluder that fragments still registers. LOWER = catch fainter occluders but
+  # more depth-noise false positives; HIGHER = require a more substantial occluder.
+  occlusion_min_area_ratio: 0.003
+  # Width of the band around the car silhouette within which outliers count as "on
+  # the car", as a fraction of the smaller image dimension (0.02 = 2%). Drops hull
+  # overspill far from the car while still covering occlusion holes in the silhouette.
+  occlusion_band_ratio: 0.02
+  # Morphological-OPEN cleanup of the outlier map, in pixels. 0 = OFF (default):
+  # thin occluders are only a few px wide and opening would erase them. Raise only
+  # if clean cars show scattered false outliers from depth noise.
+  occlusion_erode_px: 0

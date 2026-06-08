@@ -26,7 +26,7 @@ therefore has a depth SMALLER than the car's.
 import cv2
 import numpy as np
 
-from .config import ObstacleConfig
+from .config import load_config
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ def find_obstacles(sam_masks, depth_map, car, config=None):
     car : dict                         Output of car.identify_car_region(...).
     config : ObstacleConfig | None
     """
-    cfg = config or ObstacleConfig()
+    cfg = config or load_config()
     car_mask_bin = car["car_mask_bin"]
     vehicle_mask_bin = car.get("vehicle_mask_bin")
     car_idx = car["car_idx"]
@@ -227,7 +227,7 @@ def find_occlusion_obstacles(car, depth_map, config=None):
     Returns (found, occlusion_mask_bin) -- occlusion_mask_bin is a boolean (H, W)
     map of the flagged outlier pixels (all-False when nothing is found).
     """
-    cfg = config or ObstacleConfig()
+    cfg = config or load_config()
     car_mask_bin = car["car_mask_bin"]
     car_depth = car["car_depth"]
     H, W = depth_map.shape

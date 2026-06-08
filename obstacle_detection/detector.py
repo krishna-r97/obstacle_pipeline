@@ -17,7 +17,7 @@ Depth convention: depth_map is METRIC depth -> SMALLER = CLOSER.
 import cv2
 import numpy as np
 
-from .config import ObstacleConfig
+from .config import load_config
 from .models import get_models          # imports da3_handler, which puts Depth-Anything-3 on sys.path
 from .car import identify_car_region
 from .rules import find_obstacles, find_occlusion_obstacles   # the obstacle hooks (re-exported here)
@@ -70,7 +70,9 @@ def run_pipeline(image_path, models=None, config=None):
         obstacle_mask_indices, sam_masks, car_mask_idx, car_mask_bin
     """
     print(f"[INFO] Processing {image_path}")
-    cfg = config or ObstacleConfig()
+    # No explicit config -> load rule thresholds from rules.yaml (falls back to
+    # dataclass defaults if the file is missing). Pass a config to override.
+    cfg = config or load_config()
 
     # Load with cv2 IMREAD_COLOR (EXIF ignored) so the image is in the SAME
     # orientation SAM/ultralytics use; feed this exact RGB array to DA3 so the

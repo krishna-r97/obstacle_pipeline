@@ -23,6 +23,8 @@ from obstacle_detection import (
     run_pipeline,
     render_result_figure,
     get_models,
+    reset_models,
+    SAM_MODELS,
     OBSTACLE_IMAGES_DIR,
 )
 
@@ -76,27 +78,46 @@ def setup_logging():
     return logfile
 
 
-def run(image_path):
+def _ensure_models(sam_model: str):
+    """Return the model tuple, reloading if the cached SAM variant differs."""
+    from obstacle_detection.models import _MODEL_CACHE
+    if _MODEL_CACHE and _MODEL_CACHE["sam"].model_name != sam_model:
+        logging.info("SAM model changed to %s -- reloading all models.", sam_model)
+        reset_models()
+    return get_models(sam_model=sam_model)
+
+
+def run(image_path, sam_model):
     if image_path is None:
         logging.warning("Run requested with no image uploaded.")
         return None, "Please upload an image."
-    logging.info("Running pipeline on %s", image_path)
-    result = run_pipeline(image_path)
+    logging.info("Running pipeline on %s (SAM: %s)", image_path, sam_model)
+    models = _ensure_models(sam_model)
+    result = run_pipeline(image_path, models=models)
     fig_img = render_result_figure(result)
     status = "⚠️ Obstacle detected" if result["obstacle_exist"] else "✅ No obstacle"
     logging.info("Pipeline done: %s", status)
     return fig_img, status
 
 
+_SAM_CHOICES = list(SAM_MODELS.keys())   # ["sam2.1", "sam3"]
+_SAM_DEFAULT = "sam2.1"
+
 with gr.Blocks(title="Obstacle Detection Pipeline") as demo:
     gr.Markdown("# Obstacle Detection Pipeline\nUpload an image to run SAM + vehicle + Depth-Anything-3.")
     with gr.Row():
         inp = gr.Image(type="filepath", label="Input image", height=320)
-        status = gr.Textbox(label="Result", interactive=False)
+        with gr.Column():
+            sam_selector = gr.Radio(
+                choices=_SAM_CHOICES,
+                value=_SAM_DEFAULT,
+                label="SAM model",
+            )
+            status = gr.Textbox(label="Result", interactive=False)
     btn = gr.Button("Run pipeline", variant="primary")
     out = gr.Image(type="pil", label="Pipeline result", height=700)
 
-    btn.click(fn=run, inputs=inp, outputs=[out, status])
+    btn.click(fn=run, inputs=[inp, sam_selector], outputs=[out, status])
 
     if os.path.isdir(OBSTACLE_IMAGES_DIR):
         examples = [os.path.join(OBSTACLE_IMAGES_DIR, f)
@@ -108,5 +129,5 @@ with gr.Blocks(title="Obstacle Detection Pipeline") as demo:
 
 if __name__ == "__main__":
     setup_logging()  # start teeing all output to log.log
-    get_models()  # warm up so the first request is fast
+    get_models(sam_model=_SAM_DEFAULT)  # warm up so the first request is fast
     demo.launch(server_name="0.0.0.0", server_port=7860)

@@ -224,3 +224,89 @@ class ObstacleConfig:
     # opening would erase them. Raise only if depth noise on the car body produces
     # scattered false outliers on clean cars.
     occlusion_erode_px: int = 0
+
+    @classmethod
+    def from_yaml(cls, path=None, **overrides):
+        """Build an ObstacleConfig from the per-rule YAML file (see rules.yaml).
+
+        The YAML is grouped by rule (one section each for min_area, car_part,
+        foreground, ground, touch, occlusion -- mirroring detector.OBSTACLE_RULES);
+        this flattens those groups onto the dataclass fields via _RULE_YAML_SCHEMA.
+        Any field absent from the YAML keeps its dataclass default, so the file can
+        be partial. Explicit `**overrides` win over the file (handy for one-off
+        tweaks in a notebook). Unknown groups/keys raise, to catch typos early.
+        """
+        import yaml  # lazy: importing config must not require PyYAML
+
+        path = path or RULES_YAML_PATH
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+
+        unknown_groups = set(data) - set(_RULE_YAML_SCHEMA)
+        if unknown_groups:
+            raise ValueError(f"{path}: unknown rule group(s) {sorted(unknown_groups)}; "
+                             f"expected {list(_RULE_YAML_SCHEMA)}")
+
+        kwargs = {}
+        for group, key_to_field in _RULE_YAML_SCHEMA.items():
+            section = data.get(group) or {}
+            unknown_keys = set(section) - set(key_to_field)
+            if unknown_keys:
+                raise ValueError(f"{path}: unknown key(s) {sorted(unknown_keys)} under "
+                                 f"'{group}'; expected {list(key_to_field)}")
+            for ykey, field_name in key_to_field.items():
+                if ykey in section:
+                    kwargs[field_name] = section[ykey]
+
+        kwargs.update(overrides)
+        return cls(**kwargs)
+
+
+# Path to the per-rule config file shipped next to this module.
+RULES_YAML_PATH = os.path.join(os.path.dirname(__file__), "rules.yaml")
+
+# Maps the per-rule YAML layout (rules.yaml) onto the flat ObstacleConfig fields:
+# {yaml_group: {yaml_key: dataclass_field}}. The `enable` key in a rule group maps
+# to that rule's enable_* flag. Keep this in sync with OBSTACLE_RULES and the
+# ObstacleConfig fields above; from_yaml validates against it.
+_RULE_YAML_SCHEMA = {
+    "min_area": {
+        "enable": "enable_min_area_filter",
+        "min_area_ratio": "min_area_ratio",
+    },
+    "car_part": {
+        "enable": "enable_car_part_filter",
+        "car_part_containment": "car_part_containment",
+    },
+    "foreground": {
+        "enable": "enable_foreground_filter",
+        "depth_margin": "depth_margin",
+    },
+    "ground": {
+        "enable": "enable_ground_filter",
+        "ground_grad_ratio": "ground_grad_ratio",
+        "ground_bottom_frac": "ground_bottom_frac",
+        "ground_min_bottom_width": "ground_min_bottom_width",
+    },
+    "touch": {
+        "enable": "enable_touch_filter",
+    },
+    "occlusion": {
+        "use_occlusion_depth": "use_occlusion_depth",
+        "occlusion_depth_margin": "occlusion_depth_margin",
+        "occlusion_min_area_ratio": "occlusion_min_area_ratio",
+        "occlusion_band_ratio": "occlusion_band_ratio",
+        "occlusion_erode_px": "occlusion_erode_px",
+    },
+}
+
+
+def load_config(path=None, **overrides):
+    """Return the pipeline config: load rules.yaml if present, else dataclass
+    defaults. This is the single entry the pipeline uses so rule thresholds can be
+    tuned in rules.yaml without touching code. `**overrides` always win.
+    """
+    target = path or RULES_YAML_PATH
+    if os.path.exists(target):
+        return ObstacleConfig.from_yaml(target, **overrides)
+    return ObstacleConfig(**overrides)
