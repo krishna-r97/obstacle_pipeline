@@ -14,8 +14,11 @@ is just orchestration + result packaging for the notebook / Gradio app.
 Depth convention: depth_map is METRIC depth -> SMALLER = CLOSER.
 """
 
+import time
 import cv2
 import numpy as np
+import torch
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import load_config
 from .models import get_models          # imports da3_handler, which puts Depth-Anything-3 on sys.path
@@ -160,4 +163,155 @@ def run_pipeline(image_path, models=None, config=None):
         "occlusion_mask_bin": occlusion_mask_bin,   # depth-outlier occluder pixels
         "mask_obstacle_exist": mask_exist,          # which mechanism fired
         "occlusion_exist": occ_exist,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Inference helpers: unoptimized (sequential) and optimized (parallel + fast)
+# ---------------------------------------------------------------------------
+
+def run_inference_unoptimized(image_path, models=None, config=None):
+    """Run SAM2 and DA3 inference sequentially with no runtime optimizations.
+
+    Each model is called one after the other in the default float32 mode.
+    Use this as a baseline to measure latency and output correctness before
+    enabling the optimized path.
+
+    Returns
+    -------
+    dict with keys: original_img, sam_result, da3_result, sam_time, da3_time, total_time
+    """
+    print(f"[INFERENCE-UNOPT] Starting sequential inference on {image_path}")
+    cfg = config or load_config()
+
+    original_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    original_img = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)
+
+    sam_handler, _veh, da3_handler, device = models or get_models()
+
+    # -- SAM2: segment everything (full float32, no autocast) ------------------
+    print(f"[INFERENCE-UNOPT] SAM2 inference started  (device={device})")
+    t0 = time.perf_counter()
+    sam_result = sam_handler.segment_everything(image_path, cfg, device)
+    sam_time = time.perf_counter() - t0
+    n_masks = len(sam_result.masks.data) if sam_result.masks is not None else 0
+    print(f"[INFERENCE-UNOPT] SAM2 done  — {n_masks} masks  ({sam_time:.3f}s)")
+
+    # -- DA3: metric depth (full float32, no autocast) -------------------------
+    print(f"[INFERENCE-UNOPT] DA3  inference started  (device={device})")
+    t1 = time.perf_counter()
+    da3_result = da3_handler.infer([original_img])
+    da3_time = time.perf_counter() - t1
+    depth_shape = da3_result.depth.shape
+    print(f"[INFERENCE-UNOPT] DA3  done  — depth shape {depth_shape}  ({da3_time:.3f}s)")
+
+    total_time = sam_time + da3_time
+    print(f"[INFERENCE-UNOPT] Total sequential time: {total_time:.3f}s  "
+          f"(SAM2={sam_time:.3f}s  DA3={da3_time:.3f}s)")
+
+    return {
+        "original_img": original_img,
+        "sam_result":   sam_result,
+        "da3_result":   da3_result,
+        "sam_time":     sam_time,
+        "da3_time":     da3_time,
+        "total_time":   total_time,
+    }
+
+
+def run_inference_optimized(image_path, models=None, config=None):
+    """Run SAM2 and DA3 inference with full speed optimizations.
+
+    Optimizations applied
+    ---------------------
+    * torch.no_grad()     — skip gradient tracking for both models.
+    * torch.autocast()    — FP16 mixed precision on CUDA (float32 on CPU).
+    * cudnn.benchmark     — let cuDNN pick the fastest convolution kernel for
+                            this input shape (one-time overhead, then faster).
+    * Parallel execution  — SAM2 GPU inference and DA3 CPU preprocessing run
+                            concurrently via ThreadPoolExecutor(max_workers=2).
+                            On a single GPU the two CUDA kernels still serialize,
+                            but DA3 image preprocessing (normalization, resize)
+                            overlaps with SAM2's GPU time, cutting total wall time.
+
+    Returns the same dict shape as run_inference_unoptimized plus a
+    `parallel_time` key for the overlapped wall time.
+    """
+    print(f"[INFERENCE-OPT] Starting optimized parallel inference on {image_path}")
+    cfg = config or load_config()
+
+    original_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    original_img = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)
+
+    sam_handler, _veh, da3_handler, device = models or get_models()
+
+    use_cuda   = device == "cuda" and torch.cuda.is_available()
+    amp_dtype  = torch.float16 if use_cuda else torch.bfloat16
+    autocast_ctx = torch.autocast(device_type="cuda" if use_cuda else "cpu",
+                                  dtype=amp_dtype)
+
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
+        print(f"[INFERENCE-OPT] CUDA detected — FP16 autocast + cudnn.benchmark enabled")
+    else:
+        print(f"[INFERENCE-OPT] CPU mode — bfloat16 autocast enabled")
+
+    sam_time_box   = [0.0]
+    da3_time_box   = [0.0]
+    sam_result_box = [None]
+    da3_result_box = [None]
+
+    def _run_sam():
+        print(f"[INFERENCE-OPT] [SAM2 thread] inference started")
+        t0 = time.perf_counter()
+        with torch.no_grad(), autocast_ctx:
+            result = sam_handler.segment_everything(image_path, cfg, device)
+        sam_time_box[0] = time.perf_counter() - t0
+        n_masks = len(result.masks.data) if result.masks is not None else 0
+        print(f"[INFERENCE-OPT] [SAM2 thread] done — {n_masks} masks  ({sam_time_box[0]:.3f}s)")
+        sam_result_box[0] = result
+
+    def _run_da3():
+        print(f"[INFERENCE-OPT] [DA3  thread] inference started")
+        t0 = time.perf_counter()
+        with torch.no_grad(), autocast_ctx:
+            result = da3_handler.infer([original_img])
+        da3_time_box[0] = time.perf_counter() - t0
+        print(f"[INFERENCE-OPT] [DA3  thread] done — depth shape {result.depth.shape}  ({da3_time_box[0]:.3f}s)")
+        da3_result_box[0] = result
+
+    # Run both model inferences concurrently; DA3 CPU preprocessing overlaps
+    # with SAM2 GPU compute. Futures are consumed in completion order so we
+    # log whichever finishes first.
+    wall_t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {pool.submit(_run_sam): "SAM2", pool.submit(_run_da3): "DA3"}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            exc  = fut.exception()
+            if exc:
+                raise RuntimeError(f"[INFERENCE-OPT] {name} thread raised: {exc}") from exc
+            print(f"[INFERENCE-OPT] {name} thread completed first (wall order)")
+
+    if use_cuda:
+        torch.cuda.synchronize()
+
+    parallel_time = time.perf_counter() - wall_t0
+    total_time    = sam_time_box[0] + da3_time_box[0]
+    saved_time    = total_time - parallel_time
+
+    print(f"[INFERENCE-OPT] Parallel wall time : {parallel_time:.3f}s")
+    print(f"[INFERENCE-OPT] Sequential sum     : {total_time:.3f}s  "
+          f"(SAM2={sam_time_box[0]:.3f}s  DA3={da3_time_box[0]:.3f}s)")
+    print(f"[INFERENCE-OPT] Time saved by overlap: {max(saved_time, 0):.3f}s  "
+          f"({max(saved_time,0)/total_time*100:.1f}%)" if total_time > 0 else "")
+
+    return {
+        "original_img":  original_img,
+        "sam_result":    sam_result_box[0],
+        "da3_result":    da3_result_box[0],
+        "sam_time":      sam_time_box[0],
+        "da3_time":      da3_time_box[0],
+        "total_time":    total_time,
+        "parallel_time": parallel_time,
     }

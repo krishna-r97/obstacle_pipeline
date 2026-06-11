@@ -28,7 +28,7 @@ from .handlers import SAMHandler, SAM2Handler, VehicleModelHandler, DepthAnythin
 from .models import get_models, reset_models
 from .car import identify_car_region
 from .rules import find_obstacles, find_occlusion_obstacles
-from .detector import run_pipeline
+from .detector import run_pipeline, run_inference_unoptimized, run_inference_optimized
 from .visualize import render_result_figure, obstacle_overlay
 
 __all__ = [
@@ -47,6 +47,8 @@ __all__ = [
     "reset_models",
     "identify_car_region",
     "run_pipeline",
+    "run_inference_unoptimized",
+    "run_inference_optimized",
     "find_obstacles",
     "find_occlusion_obstacles",
     "render_result_figure",
