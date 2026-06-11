@@ -63,6 +63,8 @@ class SAMHandler:
                 mode="predict",
                 half=True,          # FP16 for faster inference
                 verbose=False,
+                save=False,         # don't write annotated images to runs/
+                imgsz=644,          # nearest multiple of SAM3's stride-14 above 640
             )
             if device is not None:
                 overrides["device"] = device
